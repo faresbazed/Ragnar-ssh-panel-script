@@ -1,28 +1,8 @@
-# SSH VPN Panel
+# Ragnar SSH VPN Panel v2.0
 
-A full-featured SSH VPN panel script for Linux servers, compatible with **NPV Tunnel**, **HTTP Injector**, and similar tunnel apps.
+NPV Tunnel optimized SSH VPN panel for Linux servers.
 
-## Features
-
-- **SSH over WebSocket (WS/WSS)** — ports 8880 / 8443
-- **SSH over TLS** — port 443 via Stunnel
-- **Multi-port SSH** — 22, 80, 443
-- **User management** — create, delete, lock, extend expiry
-- **Live connection monitor**
-- **Firewall/port management**
-- **One-click installer**
-
-## Requirements
-
-- Linux server (Debian/Ubuntu recommended)
-- Root access
-- Open ports: 22, 80, 443, 8880, 8443
-
-## Quick Install
-
-### One-click (recommended)
-
-Run this single command on your server as root:
+## One-Click Install
 
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/faresbazed/Ragnar-ssh-panel-script/main/install.sh)
@@ -34,52 +14,83 @@ Or with wget:
 wget -qO- https://raw.githubusercontent.com/faresbazed/Ragnar-ssh-panel-script/main/install.sh | bash
 ```
 
-### Manual install
-
-```bash
-git clone https://github.com/faresbazed/Ragnar-ssh-panel-script.git
-cd Ragnar-ssh-panel-script
-sudo bash install.sh
-```
-
-After install, launch the panel anytime with:
+Then open the panel anytime with:
 
 ```bash
 vpn
 ```
 
-## NPV Tunnel / HTTP Injector Settings
+---
+
+## Features
+
+| Feature | Details |
+|---------|---------|
+| SSH-WebSocket | Port 80 (configurable), handles WS Upgrade + HTTP CONNECT + GET inject |
+| SSH-TLS | Port 443 via Stunnel — bypasses DPI |
+| Cloudflare Free Domain | `*.trycloudflare.com` — no account needed |
+| Payload Configurator | 4 presets + custom payload for NPV Tunnel |
+| User Management | Create, delete, lock, extend, kill sessions |
+| Auto-Expiry | Cron runs every 5 min — locks expired accounts automatically |
+| Login Limit | Enforces max concurrent sessions per user |
+| Live Monitor | Real-time session viewer with limit warnings |
+| Service Control | Restart any/all services in one click |
+| Backup / Restore | Tar backup of all config + restore |
+| Log Viewer | Panel, SSH auth, WS, Stunnel, Cloudflare logs |
+| Update | In-panel update from GitHub |
+| Uninstall | Full clean removal (SSH stays intact) |
+
+---
+
+## NPV Tunnel Settings
 
 | Mode | Host | Port |
 |------|------|------|
-| SSH Direct | your-server-ip | 22 / 80 |
-| SSH WebSocket (WS) | your-server-ip | 80 |
-| SSH WebSocket (WSS) | your-server-ip | 8443 |
+| SSH | your-server-ip | 22 |
+| WebSocket (WS) | your-server-ip | 80 |
+| WebSocket fallback | your-server-ip | 8880 |
 | SSH over TLS | your-server-ip | 443 |
+| Cloudflare WS | your-cf-domain.trycloudflare.com | 443 |
 
-**Payload (HTTP Injector / NPV Tunnel):**
+**Default Payload:**
 ```
-GET / HTTP/1.1[crlf]Host: your-server-ip[crlf][crlf]
+GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]
 ```
+
+---
 
 ## Panel Menu
 
 ```
-[1] Install SSH Services        — sets up OpenSSH on ports 22, 80, 443
-[2] SSH-WebSocket Setup         — installs Python WS proxy
-[3] SSH-TLS Setup (Stunnel)     — wraps SSH in TLS on port 443
-[4] User Management             — create/delete/lock/extend users
-[5] Port Management             — add/remove ports, open firewall
-[6] Monitor Connections         — live active session monitor
-[7] Show Connection Details     — all config info in one view
-[8] System Information          — CPU, RAM, disk, uptime
+[1] Full Setup          — installs everything in one go
+[2] SSH-WebSocket       — WS proxy setup and port config
+[3] SSH-TLS (Stunnel)   — TLS on port 443
+[4] Cloudflare Domain   — free *.trycloudflare.com domain
+[5] Payload Config      — set HTTP payload for NPV Tunnel
+[6] User Management     — create/delete/lock/extend/kill
+[7] Live Monitor        — real-time connections
+[8] Connection Details  — full NPV config info
+[9] Service Control     — restart/status all services
+[L] Log Viewer          — panel, SSH, WS, CF logs
+[B] Backup/Restore      — save and restore config
+[I] System Info         — CPU, RAM, disk
+[U] Update              — update from GitHub
+[X] Uninstall           — full removal
 ```
 
-## Supported OS
+---
 
-- Ubuntu 18.04 / 20.04 / 22.04
-- Debian 9 / 10 / 11
-- CentOS 7 / 8 (basic support)
+## Requirements
+
+- Linux (Ubuntu 18.04+ / Debian 9+ recommended)
+- Root access
+- Open ports: 22, 80, 443, 8880
+
+## Notes
+
+- Users are created VPN-only (`/bin/false` shell) — no terminal access
+- SSH config is modified safely — existing ports are never removed
+- Auto-expiry cron runs every 5 minutes
 
 ## License
 
