@@ -16,7 +16,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 INSTALL_DIR="/usr/local/ssh-vpn-panel"
-SCRIPT_URL="https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/panel.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/faresbazed/Ragnar-ssh-panel-script/main/panel.sh"
 
 echo -e "${CYAN}"
 echo "  ╔══════════════════════════════════════════╗"
