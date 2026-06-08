@@ -141,36 +141,28 @@ install_ssh_services() {
 configure_ssh() {
     SSHD_CONFIG="/etc/ssh/sshd_config"
 
-    cp "$SSHD_CONFIG" "${SSHD_CONFIG}.backup.$(date +%Y%m%d)"
+    # Backup original config — never destroy it
+    cp "$SSHD_CONFIG" "${SSHD_CONFIG}.backup.$(date +%Y%m%d%H%M%S)"
+    echo -e "  ${GREEN}[✓] Backup saved: ${SSHD_CONFIG}.backup.$(date +%Y%m%d%H%M%S)${NC}"
 
-    cat > "$SSHD_CONFIG" << 'SSHCONF'
-Port 22
-Port 80
-Port 443
-AddressFamily inet
-ListenAddress 0.0.0.0
+    # Add extra ports only if not already present (preserves existing ports like 22022)
+    for ADD_PORT in 80 443; do
+        if ! grep -q "^Port ${ADD_PORT}$" "$SSHD_CONFIG"; then
+            echo "Port ${ADD_PORT}" >> "$SSHD_CONFIG"
+            echo -e "  ${GREEN}[✓] Added Port ${ADD_PORT}${NC}"
+        fi
+    done
 
-PermitRootLogin yes
-PubkeyAuthentication yes
-AuthorizedKeysFile .ssh/authorized_keys
-PasswordAuthentication yes
-PermitEmptyPasswords no
-ChallengeResponseAuthentication no
+    # Enable password auth and root login safely (only set if missing/disabled)
+    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' "$SSHD_CONFIG"
+    sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' "$SSHD_CONFIG"
+    sed -i 's/^#*ClientAliveInterval.*/ClientAliveInterval 60/' "$SSHD_CONFIG"
+    sed -i 's/^#*ClientAliveCountMax.*/ClientAliveCountMax 3/' "$SSHD_CONFIG"
+    sed -i 's/^#*MaxSessions.*/MaxSessions 10/' "$SSHD_CONFIG"
 
-UsePAM yes
-X11Forwarding yes
-PrintMotd no
-ClientAliveInterval 60
-ClientAliveCountMax 3
-
-MaxAuthTries 6
-MaxSessions 10
-
-AcceptEnv LANG LC_*
-Subsystem sftp /usr/lib/openssh/sftp-server
-
-Banner /etc/ssh/banner
-SSHCONF
+    # If settings don't exist at all, append them
+    grep -q "^PermitRootLogin" "$SSHD_CONFIG"    || echo "PermitRootLogin yes"    >> "$SSHD_CONFIG"
+    grep -q "^PasswordAuthentication" "$SSHD_CONFIG" || echo "PasswordAuthentication yes" >> "$SSHD_CONFIG"
 
     cat > /etc/ssh/banner << 'BANNER'
 ##############################################
@@ -179,8 +171,12 @@ SSHCONF
 ##############################################
 BANNER
 
+    # Add banner only if not already set
+    grep -q "^Banner" "$SSHD_CONFIG" || echo "Banner /etc/ssh/banner" >> "$SSHD_CONFIG"
+
     systemctl restart ssh >> "$LOG_FILE" 2>&1
-    echo -e "  ${GREEN}[✓] SSH configured on ports 22, 80, 443${NC}"
+    PORTS=$(grep "^Port" "$SSHD_CONFIG" | awk '{print $2}' | tr '\n' ',' | sed 's/,$//')
+    echo -e "  ${GREEN}[✓] SSH active on ports: ${PORTS}${NC}"
 }
 
 setup_websocket() {
@@ -450,9 +446,19 @@ create_user() {
     read -r MAX_LOGINS
     MAX_LOGINS=${MAX_LOGINS:-2}
 
+    echo -ne "  ${YELLOW}Allow full SSH login? (y/N) [N=VPN-only]: ${NC}"
+    read -r FULL_LOGIN
+    if [[ "${FULL_LOGIN,,}" == "y" ]]; then
+        USER_SHELL="/bin/bash"
+        LOGIN_TYPE="Full SSH"
+    else
+        USER_SHELL="/bin/false"
+        LOGIN_TYPE="VPN-only (no shell)"
+    fi
+
     EXPIRY_DATE=$(date -d "+${DAYS} days" '+%Y-%m-%d')
 
-    useradd -M -s /bin/false -e "$EXPIRY_DATE" "$USERNAME" >> "$LOG_FILE" 2>&1
+    useradd -m -s "$USER_SHELL" -e "$EXPIRY_DATE" "$USERNAME" >> "$LOG_FILE" 2>&1
     echo "$USERNAME:$PASSWORD" | chpasswd >> "$LOG_FILE" 2>&1
 
     echo "${USERNAME}:${PASSWORD}:${EXPIRY_DATE}:${MAX_LOGINS}:$(date '+%Y-%m-%d')" >> "$USER_DB"
@@ -465,6 +471,7 @@ create_user() {
     echo -e "  │  Password   : ${PASSWORD}"
     echo -e "  │  Expires    : ${EXPIRY_DATE} (${DAYS} days)"
     echo -e "  │  Max Logins : ${MAX_LOGINS}"
+    echo -e "  │  Login Type : ${LOGIN_TYPE}"
     echo -e "  │  SSH Host   : ${IP}"
     echo -e "  │  SSH Port   : 22 / 80"
     echo -e "  │  WS Port    : 80"
