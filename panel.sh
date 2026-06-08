@@ -183,10 +183,9 @@ configure_ssh_safe() {
     local CFG="/etc/ssh/sshd_config"
     cp "$CFG" "${CFG}.backup.$(date +%Y%m%d%H%M%S)" 2>/dev/null
 
-    # Only ADD ports 80/443 if not already there — never remove existing ports
-    for P in 80 443; do
-        grep -q "^Port ${P}$" "$CFG" || echo "Port ${P}" >> "$CFG"
-    done
+    # Only add port 80 to SSH — port 443 is reserved for Stunnel only
+    # (if SSH also binds 443, Stunnel can never start on 443)
+    grep -q "^Port 80$" "$CFG" || echo "Port 80" >> "$CFG"
 
     # Safe sed — won't duplicate lines
     sed -i '/^#*PasswordAuthentication/c\PasswordAuthentication yes' "$CFG"
@@ -467,6 +466,23 @@ deploy_stunnel_silent() {
     detect_os
     $PKG_MANAGER install -y stunnel4 openssl >> "$LOG_FILE" 2>&1
     mkdir -p /etc/stunnel /var/run/stunnel4 /var/log/stunnel4
+
+    # Remove Port 443 from SSH config if present — Stunnel owns 443
+    local CFG="/etc/ssh/sshd_config"
+    if grep -q "^Port 443$" "$CFG"; then
+        sed -i '/^Port 443$/d' "$CFG"
+        systemctl restart ssh >> "$LOG_FILE" 2>&1
+        echo -e "  ${YELLOW}[!] Removed Port 443 from SSH (Stunnel takes 443)${NC}"
+    fi
+
+    # Kill anything on port 443 before stunnel tries to bind
+    local PIDS443; PIDS443=$(ss -tlnp "sport = :443" 2>/dev/null | awk 'NR>1{print $NF}' | grep -oP 'pid=\K[0-9]+')
+    if [[ -n "$PIDS443" ]]; then
+        echo -e "  ${YELLOW}[!] Clearing port 443...${NC}"
+        echo "$PIDS443" | xargs -r kill -9 2>/dev/null
+        sleep 1
+    fi
+
     local IP; IP=$(get_public_ip)
     openssl req -new -x509 -days 3650 -nodes \
         -out /etc/stunnel/stunnel.pem -keyout /etc/stunnel/stunnel.pem \
@@ -478,14 +494,22 @@ pid     = /var/run/stunnel4/stunnel4.pid
 output  = /var/log/stunnel4/stunnel.log
 socket  = l:TCP_NODELAY=1
 socket  = r:TCP_NODELAY=1
+foreground = no
 
 [npv-tls]
-accept  = 443
+accept  = 0.0.0.0:443
 connect = 127.0.0.1:22
 cert    = /etc/stunnel/stunnel.pem
 TIMEOUTclose = 0
+sslVersion = all
+options = NO_SSLv2
+options = NO_SSLv3
 STLCONF
 
+    # Ensure stunnel4 is enabled to run in /etc/default/stunnel4
+    sed -i 's/^ENABLED=0/ENABLED=1/' /etc/default/stunnel4 2>/dev/null
+
+    systemctl daemon-reload
     systemctl enable stunnel4 >> "$LOG_FILE" 2>&1
     systemctl restart stunnel4 >> "$LOG_FILE" 2>&1
 }
@@ -561,6 +585,9 @@ install_cloudflare() {
     fi
 
     local WS_P; WS_P=$(get_ws_port)
+    # cloudflared quick tunnel → our WS proxy on port 80
+    # Cloudflare handles HTTPS on their side; we get plain HTTP/WS on our side
+    # --no-autoupdate keeps it stable, --http2-origin improves WS reliability
     cat > /etc/systemd/system/cloudflared-tunnel.service << CFSVC
 [Unit]
 Description=Cloudflare Quick Tunnel → SSH-WS port ${WS_P}
@@ -568,7 +595,7 @@ After=network.target ssh-ws.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:${WS_P} --no-autoupdate
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:${WS_P} --no-autoupdate --loglevel info
 Restart=always
 RestartSec=10
 User=root
@@ -607,15 +634,24 @@ CFSVC
 
 _print_npv_cf_config() {
     local DOM="$1"
+    local BARE; BARE=$(echo "$DOM" | sed 's|https://||')
     local IP; IP=$(get_public_ip)
+    local PAYLOAD; PAYLOAD=$(cat "$PAYLOAD_FILE" 2>/dev/null)
     echo -e "\n  ${WHITE}┌──────────────────────────────────────────────────────┐"
-    echo -e "  │  NPV Tunnel Settings via Cloudflare:                 │"
+    echo -e "  │  NPV Tunnel Settings (Cloudflare WS mode):           │"
     echo -e "  ├──────────────────────────────────────────────────────┤"
-    echo -e "  │  SSH Host   : ${IP}"
-    echo -e "  │  SSH Port   : 22"
-    echo -e "  │  Proxy Host : ${DOM}"
-    echo -e "  │  Proxy Port : 443 (Cloudflare HTTPS)"
-    echo -e "  │  Proxy Type : WebSocket over HTTPS"
+    echo -e "  │  SSH Host    : ${IP}"
+    echo -e "  │  SSH Port    : 22"
+    echo -e "  ├──────────────────────────────────────────────────────┤"
+    echo -e "  │  Network     : WebSocket"
+    echo -e "  │  WS Host     : ${BARE}"
+    echo -e "  │  WS Port     : 443"
+    echo -e "  │  SSL/TLS     : ON  (Cloudflare handles it)"
+    echo -e "  ├──────────────────────────────────────────────────────┤"
+    echo -e "  │  Payload     : ${PAYLOAD}"
+    echo -e "  ├──────────────────────────────────────────────────────┤"
+    echo -e "  │  NOTE: WS Host is the Cloudflare domain, NOT your IP │"
+    echo -e "  │  SSH Host is still your real server IP               │"
     echo -e "  └──────────────────────────────────────────────────────┘${NC}"
 }
 
@@ -1146,25 +1182,57 @@ update_panel() {
 
 uninstall_panel() {
     banner
-    echo -e "${RED}  [!] UNINSTALL PANEL${NC}\n"
-    echo -e "  Removes: WS proxy, Stunnel, Cloudflare, panel files, cron, 'vpn' command"
-    echo -e "  ${YELLOW}SSH server stays intact.${NC}\n"
+    echo -e "${RED}  [!] FULL UNINSTALL — removes everything added by this panel${NC}\n"
+    echo -e "  Will remove:"
+    echo -e "  ${RED}●${NC} ssh-ws / ssh-wss / stunnel4 / cloudflared services"
+    echo -e "  ${RED}●${NC} WS proxy script, expiry script, cloudflared binary"
+    echo -e "  ${RED}●${NC} Stunnel config + TLS certificates"
+    echo -e "  ${RED}●${NC} Panel config dir, user database, log file"
+    echo -e "  ${RED}●${NC} SSH ports 80/443 added by panel (your original ports stay)"
+    echo -e "  ${RED}●${NC} SSH banner added by panel"
+    echo -e "  ${RED}●${NC} Cron job for auto-expiry"
+    echo -e "  ${RED}●${NC} 'vpn' command alias"
+    echo -e "  ${YELLOW}  SSH server itself stays intact.${NC}\n"
     echo -ne "  ${RED}Type UNINSTALL to confirm: ${NC}"; read -r C
     [[ "$C" != "UNINSTALL" ]] && { main_menu; return; }
 
+    echo -e "\n  ${CYAN}Removing services...${NC}"
     for SVC in cloudflared-tunnel ssh-ws ssh-wss stunnel4; do
-        systemctl stop "$SVC" 2>/dev/null
+        systemctl stop    "$SVC" 2>/dev/null
         systemctl disable "$SVC" 2>/dev/null
         rm -f "/etc/systemd/system/${SVC}.service"
+        echo -e "  ${GREEN}[✓]${NC} $SVC removed"
     done
     systemctl daemon-reload
-    rm -f /usr/local/bin/cloudflared /usr/local/bin/ssh-ws-proxy.py /usr/local/bin/ssh-vpn-expiry.sh
-    rm -rf "$CONFIG_DIR" "$INSTALL_DIR" "$LOG_FILE"
-    rm -f /usr/local/bin/vpn
-    # Remove cron entry
-    crontab -l 2>/dev/null | grep -v 'ssh-vpn-expiry' | crontab -
 
-    echo -e "\n  ${GREEN}[✓] Panel fully uninstalled.${NC}\n"
+    echo -e "\n  ${CYAN}Removing binaries + configs...${NC}"
+    rm -f /usr/local/bin/cloudflared
+    rm -f /usr/local/bin/ssh-ws-proxy.py
+    rm -f /usr/local/bin/ssh-vpn-expiry.sh
+    rm -f /usr/local/bin/vpn
+    rm -rf "$CONFIG_DIR" "$INSTALL_DIR"
+    rm -f "$LOG_FILE"
+    rm -rf /etc/stunnel
+    rm -rf /var/log/stunnel4
+    rm -f /etc/ssh/banner
+    echo -e "  ${GREEN}[✓]${NC} Files removed"
+
+    echo -e "\n  ${CYAN}Cleaning SSH config (removing panel-added ports)...${NC}"
+    local CFG="/etc/ssh/sshd_config"
+    # Remove only the ports we added (80 and 443) — keep all original ports
+    sed -i '/^Port 80$/d'  "$CFG" 2>/dev/null
+    sed -i '/^Port 443$/d' "$CFG" 2>/dev/null
+    sed -i '/^Banner \/etc\/ssh\/banner$/d' "$CFG" 2>/dev/null
+    # Remove all backup files made by this panel
+    rm -f /etc/ssh/sshd_config.backup.* 2>/dev/null
+    systemctl restart ssh >> /dev/null 2>&1
+    echo -e "  ${GREEN}[✓]${NC} SSH config cleaned (ports 80/443 removed)"
+
+    echo -e "\n  ${CYAN}Removing cron job...${NC}"
+    crontab -l 2>/dev/null | grep -v 'ssh-vpn-expiry' | crontab -
+    echo -e "  ${GREEN}[✓]${NC} Cron removed"
+
+    echo -e "\n  ${GREEN}[✓] Panel fully uninstalled. Server is clean.${NC}\n"
     exit 0
 }
 
