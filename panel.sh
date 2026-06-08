@@ -197,7 +197,7 @@ import select
 import sys
 import struct
 
-LISTEN_PORT_WS = 8880   # WS (plain WebSocket)
+LISTEN_PORT_WS = 80     # WS (plain WebSocket)
 LISTEN_PORT_WSS = 8443  # WSS (WebSocket over TLS - stunnel handles TLS)
 SSH_HOST = '127.0.0.1'
 SSH_PORT = 22
@@ -272,13 +272,13 @@ PYWS
 
     cat > /etc/systemd/system/ssh-ws.service << 'SVCWS'
 [Unit]
-Description=SSH WebSocket Proxy (Port 8880)
+Description=SSH WebSocket Proxy (Port 80)
 After=network.target ssh.service
 Wants=ssh.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/local/bin/ssh-ws-proxy.py 8880
+ExecStart=/usr/bin/python3 /usr/local/bin/ssh-ws-proxy.py 80
 Restart=always
 RestartSec=5
 User=root
@@ -315,7 +315,7 @@ SVCWSS
     echo -e "  ┌─────────────────────────────────────────┐"
     echo -e "  │  SSH Host   : ${IP}"
     echo -e "  │  SSH Port   : 22"
-    echo -e "  │  WS Port    : 8880  (ws://${IP}:8880)"
+    echo -e "  │  WS Port    : 80    (ws://${IP}:80)"
     echo -e "  │  WSS Port   : 8443  (wss://${IP}:8443)"
     echo -e "  │  Proxy Type : WebSocket"
     echo -e "  └─────────────────────────────────────────┘${NC}"
@@ -458,7 +458,7 @@ create_user() {
     echo -e "  │  Max Logins : ${MAX_LOGINS}"
     echo -e "  │  SSH Host   : ${IP}"
     echo -e "  │  SSH Port   : 22 / 80"
-    echo -e "  │  WS Port    : 8880"
+    echo -e "  │  WS Port    : 80"
     echo -e "  │  TLS Port   : 443"
     echo -e "  └─────────────────────────────────────────┘${NC}"
 
@@ -778,7 +778,7 @@ show_connection_details() {
     echo -e "  │  [SSH WEBSOCKET (NPV Tunnel / HTTP Injector)]"
     echo -e "  │  SSH Host       : ${IP}"
     echo -e "  │  SSH Port       : 22"
-    echo -e "  │  WS URL         : ws://${IP}:8880"
+    echo -e "  │  WS URL         : ws://${IP}:80"
     echo -e "  │  WSS URL        : wss://${IP}:8443"
     echo -e "  │  Payload        : GET / HTTP/1.1[crlf]Host: ${IP}[crlf][crlf]"
     echo -e "  │"
