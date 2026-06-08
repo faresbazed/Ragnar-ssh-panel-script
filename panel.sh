@@ -2,6 +2,7 @@
 # ============================================================
 #   SSH VPN PANEL — NPV Tunnel Ready
 #   Supports: SSH-WS (80/443), SSH-TLS (443), Multi-port SSH
+#             Cloudflare Free Domain (trycloudflare.com)
 #   Compatible with: NPV Tunnel, HTTP Injector, and similar
 # ============================================================
 
@@ -13,10 +14,11 @@ CYAN='\033[0;36m'
 WHITE='\033[1;37m'
 NC='\033[0m'
 
-PANEL_VERSION="1.0.0"
+PANEL_VERSION="1.1.0"
 CONFIG_DIR="/etc/ssh-vpn-panel"
 USER_DB="$CONFIG_DIR/users.db"
 LOG_FILE="/var/log/ssh-vpn-panel.log"
+CF_DOMAIN_FILE="$CONFIG_DIR/cf_domain.txt"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
@@ -82,6 +84,7 @@ main_menu() {
     echo -e "${WHITE}  │ ${GREEN}[6]${WHITE} Monitor Connections               │${NC}"
     echo -e "${WHITE}  │ ${GREEN}[7]${WHITE} Show Connection Details           │${NC}"
     echo -e "${WHITE}  │ ${GREEN}[8]${WHITE} System Information                │${NC}"
+    echo -e "${WHITE}  │ ${CYAN}[9]${WHITE} Cloudflare Free Domain            │${NC}"
     echo -e "${WHITE}  │ ${RED}[0]${WHITE} Exit                             │${NC}"
     echo -e "${WHITE}  └──────────────────────────────────────┘${NC}"
     echo -ne "\n  ${YELLOW}Select option: ${NC}"
@@ -96,6 +99,7 @@ main_menu() {
         6) monitor_connections ;;
         7) show_connection_details ;;
         8) system_info ;;
+        9) cloudflare_menu ;;
         0) echo -e "\n${GREEN}Goodbye!${NC}\n"; exit 0 ;;
         *) echo -e "${RED}Invalid option.${NC}"; sleep 1; main_menu ;;
     esac
@@ -824,6 +828,245 @@ system_info() {
     echo -e "  │  Total Users : $(wc -l < "$USER_DB")"
     echo -e "  └──────────────────────────────────────────┘${NC}"
 
+    read -rp "  Press Enter to continue..."
+    main_menu
+}
+
+cloudflare_menu() {
+    banner
+    CF_STATUS="Not running"
+    CF_DOMAIN_DISPLAY="None"
+    if systemctl is-active --quiet cloudflared-tunnel 2>/dev/null; then
+        CF_STATUS="${GREEN}Running${NC}"
+        CF_DOMAIN_DISPLAY="${CYAN}$(cat "$CF_DOMAIN_FILE" 2>/dev/null || echo 'Unknown')${NC}"
+    else
+        CF_STATUS="${RED}Stopped${NC}"
+    fi
+
+    echo -e "${WHITE}  ┌──────────────────────────────────────┐${NC}"
+    echo -e "${WHITE}  │      CLOUDFLARE FREE DOMAIN          │${NC}"
+    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
+    echo -e "  │  Status : $(echo -e $CF_STATUS)"
+    echo -e "  │  Domain : $(echo -e $CF_DOMAIN_DISPLAY)"
+    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[1]${WHITE} Install & Start Cloudflare Tunnel │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[2]${WHITE} Show Current Domain               │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[3]${WHITE} Restart Tunnel (get new domain)   │${NC}"
+    echo -e "${WHITE}  │ ${RED}[4]${WHITE} Stop Tunnel                      │${NC}"
+    echo -e "${WHITE}  │ ${RED}[5]${WHITE} Uninstall cloudflared            │${NC}"
+    echo -e "${WHITE}  │ ${YELLOW}[0]${WHITE} Back to Main Menu                │${NC}"
+    echo -e "${WHITE}  └──────────────────────────────────────┘${NC}"
+    echo -ne "\n  ${YELLOW}Select option: ${NC}"
+    read -r OPTION
+
+    case $OPTION in
+        1) install_cloudflare ;;
+        2) show_cf_domain ;;
+        3) restart_cf_tunnel ;;
+        4) stop_cf_tunnel ;;
+        5) uninstall_cloudflare ;;
+        0) main_menu ;;
+        *) echo -e "${RED}Invalid option.${NC}"; sleep 1; cloudflare_menu ;;
+    esac
+}
+
+install_cloudflare() {
+    banner
+    echo -e "${CYAN}  [*] Setting up Cloudflare Free Domain...${NC}\n"
+    echo -e "${WHITE}  This installs cloudflared and creates a FREE tunnel."
+    echo -e "  You get a public domain like: abc123.trycloudflare.com"
+    echo -e "  No Cloudflare account required!${NC}\n"
+
+    detect_os
+
+    if command -v cloudflared &>/dev/null; then
+        echo -e "  ${YELLOW}cloudflared already installed. Starting tunnel...${NC}"
+    else
+        echo -e "${YELLOW}  [1/3] Downloading cloudflared...${NC}"
+        ARCH=$(uname -m)
+        case "$ARCH" in
+            x86_64)  CF_ARCH="amd64" ;;
+            aarch64) CF_ARCH="arm64" ;;
+            armv7l)  CF_ARCH="arm" ;;
+            *)       CF_ARCH="amd64" ;;
+        esac
+
+        CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
+        curl -sSL "$CF_URL" -o /usr/local/bin/cloudflared >> "$LOG_FILE" 2>&1
+        chmod +x /usr/local/bin/cloudflared
+
+        if ! command -v cloudflared &>/dev/null; then
+            echo -e "  ${RED}[✗] Failed to install cloudflared. Check your internet connection.${NC}"
+            read -rp "  Press Enter to continue..."
+            cloudflare_menu; return
+        fi
+        echo -e "  ${GREEN}[✓] cloudflared installed.${NC}"
+    fi
+
+    echo -e "${YELLOW}  [2/3] Creating systemd tunnel service...${NC}"
+
+    cat > /etc/systemd/system/cloudflared-tunnel.service << 'CFSVC'
+[Unit]
+Description=Cloudflare Quick Tunnel (SSH-WS)
+After=network.target ssh-ws.service
+Wants=ssh-ws.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:80 --no-autoupdate
+Restart=always
+RestartSec=10
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+CFSVC
+
+    systemctl daemon-reload
+    systemctl enable cloudflared-tunnel >> "$LOG_FILE" 2>&1
+    systemctl restart cloudflared-tunnel >> "$LOG_FILE" 2>&1
+
+    echo -e "${YELLOW}  [3/3] Waiting for Cloudflare to assign domain...${NC}"
+    CF_DOMAIN=""
+    for i in $(seq 1 20); do
+        sleep 3
+        CF_DOMAIN=$(journalctl -u cloudflared-tunnel --no-pager -n 50 2>/dev/null | \
+            grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1)
+        if [[ -n "$CF_DOMAIN" ]]; then
+            break
+        fi
+        echo -ne "  Waiting... (${i}/20)\r"
+    done
+
+    if [[ -z "$CF_DOMAIN" ]]; then
+        echo -e "\n  ${YELLOW}[!] Domain not detected yet. Try option [2] in a moment.${NC}"
+        log "Cloudflare tunnel started but domain not yet detected"
+        read -rp "  Press Enter to continue..."
+        cloudflare_menu; return
+    fi
+
+    echo "$CF_DOMAIN" > "$CF_DOMAIN_FILE"
+
+    echo -e "\n  ${GREEN}[✓] Cloudflare tunnel is LIVE!${NC}"
+    echo -e "\n  ${WHITE}┌──────────────────────────────────────────────────────┐"
+    echo -e "  │         YOUR FREE CLOUDFLARE DOMAIN                  │"
+    echo -e "  ├──────────────────────────────────────────────────────┤"
+    echo -e "  │  Domain  : ${CYAN}${CF_DOMAIN}${WHITE}"
+    echo -e "  │  WS URL  : ${CYAN}${CF_DOMAIN}${WHITE}  (port 80 tunneled)"
+    echo -e "  │"
+    echo -e "  │  NPV Tunnel / HTTP Injector Settings:"
+    echo -e "  │  ► SSH Host  : $(get_public_ip)"
+    echo -e "  │  ► SSH Port  : 22"
+    echo -e "  │  ► Proxy     : ${CF_DOMAIN}"
+    echo -e "  │  ► Proxy Port: 443 (Cloudflare HTTPS)"
+    echo -e "  └──────────────────────────────────────────────────────┘${NC}"
+
+    log "Cloudflare tunnel started: $CF_DOMAIN"
+    read -rp "  Press Enter to continue..."
+    cloudflare_menu
+}
+
+show_cf_domain() {
+    banner
+    echo -e "${CYAN}  [*] Current Cloudflare Domain${NC}\n"
+
+    if ! systemctl is-active --quiet cloudflared-tunnel 2>/dev/null; then
+        echo -e "  ${RED}[✗] Cloudflare tunnel is not running.${NC}"
+        echo -e "  ${YELLOW}Use option [1] to install and start it.${NC}"
+        read -rp "  Press Enter to continue..."
+        cloudflare_menu; return
+    fi
+
+    CF_DOMAIN=$(journalctl -u cloudflared-tunnel --no-pager -n 100 2>/dev/null | \
+        grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1)
+
+    if [[ -z "$CF_DOMAIN" ]]; then
+        CF_DOMAIN=$(cat "$CF_DOMAIN_FILE" 2>/dev/null)
+    fi
+
+    if [[ -z "$CF_DOMAIN" ]]; then
+        echo -e "  ${YELLOW}[!] Domain not detected yet. Wait a few seconds and try again.${NC}"
+        read -rp "  Press Enter to continue..."
+        cloudflare_menu; return
+    fi
+
+    echo "$CF_DOMAIN" > "$CF_DOMAIN_FILE"
+    IP=$(get_public_ip)
+
+    echo -e "  ${WHITE}┌──────────────────────────────────────────────────────┐"
+    echo -e "  │  Free Domain  : ${CYAN}${CF_DOMAIN}${WHITE}"
+    echo -e "  │  Tunnel Port  : 443 (Cloudflare HTTPS → port 80)"
+    echo -e "  │  SSH Host     : ${IP}"
+    echo -e "  │  SSH Port     : 22"
+    echo -e "  │"
+    echo -e "  │  For NPV Tunnel / HTTP Injector:"
+    echo -e "  │  Host   → ${CF_DOMAIN}"
+    echo -e "  │  Port   → 443"
+    echo -e "  └──────────────────────────────────────────────────────┘${NC}"
+
+    read -rp "  Press Enter to continue..."
+    cloudflare_menu
+}
+
+restart_cf_tunnel() {
+    banner
+    echo -e "${CYAN}  [*] Restarting Cloudflare Tunnel...${NC}\n"
+    echo -e "${YELLOW}  A new random domain will be assigned.${NC}\n"
+
+    systemctl restart cloudflared-tunnel >> "$LOG_FILE" 2>&1
+
+    echo -e "  ${YELLOW}Waiting for new domain...${NC}"
+    CF_DOMAIN=""
+    for i in $(seq 1 20); do
+        sleep 3
+        CF_DOMAIN=$(journalctl -u cloudflared-tunnel --no-pager -n 50 2>/dev/null | \
+            grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1)
+        [[ -n "$CF_DOMAIN" ]] && break
+        echo -ne "  Waiting... (${i}/20)\r"
+    done
+
+    if [[ -n "$CF_DOMAIN" ]]; then
+        echo "$CF_DOMAIN" > "$CF_DOMAIN_FILE"
+        echo -e "\n  ${GREEN}[✓] New Cloudflare domain: ${CYAN}${CF_DOMAIN}${NC}"
+        log "Cloudflare tunnel restarted: $CF_DOMAIN"
+    else
+        echo -e "\n  ${YELLOW}[!] Domain not detected yet. Try option [2] in a moment.${NC}"
+    fi
+
+    read -rp "  Press Enter to continue..."
+    cloudflare_menu
+}
+
+stop_cf_tunnel() {
+    banner
+    echo -e "${CYAN}  [*] Stopping Cloudflare Tunnel...${NC}\n"
+    systemctl stop cloudflared-tunnel >> "$LOG_FILE" 2>&1
+    systemctl disable cloudflared-tunnel >> "$LOG_FILE" 2>&1
+    echo -e "  ${YELLOW}[✓] Cloudflare tunnel stopped.${NC}"
+    log "Cloudflare tunnel stopped"
+    read -rp "  Press Enter to continue..."
+    cloudflare_menu
+}
+
+uninstall_cloudflare() {
+    banner
+    echo -ne "  ${YELLOW}Remove cloudflared completely? (y/N): ${NC}"
+    read -r CONFIRM
+    if [[ "${CONFIRM,,}" != "y" ]]; then
+        cloudflare_menu; return
+    fi
+
+    systemctl stop cloudflared-tunnel >> "$LOG_FILE" 2>&1
+    systemctl disable cloudflared-tunnel >> "$LOG_FILE" 2>&1
+    rm -f /etc/systemd/system/cloudflared-tunnel.service
+    systemctl daemon-reload
+    rm -f /usr/local/bin/cloudflared
+    rm -f "$CF_DOMAIN_FILE"
+
+    echo -e "  ${GREEN}[✓] cloudflared uninstalled.${NC}"
+    log "cloudflared uninstalled"
     read -rp "  Press Enter to continue..."
     main_menu
 }
