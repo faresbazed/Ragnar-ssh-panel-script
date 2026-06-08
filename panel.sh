@@ -249,352 +249,264 @@ deploy_ws_proxy() {
     local PORT="${1:-80}"
     echo "$PORT" > "$WS_PORT_FILE"
 
+    # ── write the proxy script ────────────────────────────────────────
     cat > /usr/local/bin/ssh-ws-proxy.py << 'PYEOF'
 #!/usr/bin/env python3
 """
-Ragnar SSH-WebSocket Proxy v4.2 — Universal NPV Tunnel Handler
-
-Key fix (v4.2):
-  NPV Tunnel ONLY sends the CF-RAY second segment AFTER receiving 101.
-  Previous versions waited 3s for Seg2 before sending 101 — deadlock!
-  Now: send 101 immediately, then drain Seg2 with 5s rolling timeout.
-
-Flow:
-  NPV → Seg1 (GET / ...) → Proxy sends 101 → NPV sends Seg2 (CF-RAY ...)
-  → Proxy drains Seg2 silently → SSH relay begins cleanly
+Ragnar SSH-WS Proxy v5
+Accepts ANY HTTP method (GET, POST, CONNECT, CF-RAY, custom).
+Sends 101, drains second NPV segment, then tunnels to SSH.
 """
-import socket, threading, select, sys, time
+import socket, threading, select, sys, os, time
 
-SSH_HOST = '127.0.0.1'
-SSH_PORT = 22
-BUFFER   = 65536
-TIMEOUT  = 120
+LISTEN = int(sys.argv[1]) if len(sys.argv) > 1 else 80
+SSH    = ('127.0.0.1', 22)
+OK101  = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
+OK200  = b'HTTP/1.1 200 Connection established\r\n\r\n'
 
-WS_101      = (b"HTTP/1.1 101 Switching Protocols\r\n"
-               b"Upgrade: websocket\r\n"
-               b"Connection: Upgrade\r\n\r\n")
-CONNECT_200 = b"HTTP/1.1 200 Connection established\r\n\r\n"
-
-
-# ── Pipe ─────────────────────────────────────────────────────────
-
-def pipe(src, dst, stop):
+def fwd(a, b, ev):
     try:
-        while not stop.is_set():
-            r, _, _ = select.select([src], [], [], 10)
-            if not r:
-                continue
-            data = src.recv(BUFFER)
-            if not data:
-                break
-            dst.sendall(data)
-    except Exception:
-        pass
-    finally:
-        stop.set()
+        while not ev.is_set():
+            r, _, _ = select.select([a], [], [], 10)
+            if r:
+                d = a.recv(65536)
+                if not d: break
+                b.sendall(d)
+    except Exception: pass
+    finally: ev.set()
 
-
-def relay(client, ssh, initial=b""):
+def relay(a, b, seed=b''):
     try:
-        if initial:
-            ssh.sendall(initial)
-    except Exception:
-        return
-    stop = threading.Event()
-    threading.Thread(target=pipe, args=(client, ssh, stop), daemon=True).start()
-    threading.Thread(target=pipe, args=(ssh, client, stop), daemon=True).start()
-    stop.wait()
+        if seed: b.sendall(seed)
+    except Exception: return
+    ev = threading.Event()
+    threading.Thread(target=fwd, args=(a, b, ev), daemon=True).start()
+    threading.Thread(target=fwd, args=(b, a, ev), daemon=True).start()
+    ev.wait()
 
-
-# ── Read first HTTP segment only ──────────────────────────────────
-
-def read_first_segment(sock):
-    """
-    Read exactly ONE complete HTTP segment (up to the first \\r\\n\\r\\n).
-    Returns (headers_text, leftover_bytes)
-
-    We do NOT wait for segment 2 here — NPV won't send it until after
-    we respond with 101. Waiting here causes a deadlock.
-    """
-    buf = b""
-    sock.settimeout(5)
+def read_seg(sock, timeout=8):
+    """Read one complete HTTP segment (until \\r\\n\\r\\n)."""
+    buf = b''
+    sock.settimeout(timeout)
     try:
-        while b'\r\n\r\n' not in buf and len(buf) < 65536:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-    except socket.timeout:
-        pass
-    finally:
-        sock.settimeout(TIMEOUT)
-
+        while b'\r\n\r\n' not in buf:
+            d = sock.recv(4096)
+            if not d: break
+            buf += d
+            if len(buf) > 131072: break
+    except Exception: pass
     if b'\r\n\r\n' in buf:
-        end  = buf.index(b'\r\n\r\n')
-        return buf[:end].decode('utf-8', errors='ignore'), buf[end + 4:]
-    return buf.decode('utf-8', errors='ignore'), b""
+        i = buf.index(b'\r\n\r\n')
+        return buf[:i].decode('utf-8', errors='ignore'), buf[i+4:]
+    return buf.decode('utf-8', errors='ignore'), b''
 
-
-# ── Response chooser ─────────────────────────────────────────────
-
-def choose_response(headers):
-    for line in headers.splitlines():
-        if line.strip().upper().startswith('CONNECT '):
-            return CONNECT_200
-    return WS_101
-
-
-# ── Drain second HTTP segment (CF-RAY / GET / any) ───────────────
-
-def drain_second_segment(sock, initial=b""):
+def drain(sock, seed=b'', timeout=5):
     """
-    After sending 101, NPV immediately sends the second segment (CF-RAY /
-    or another GET with Upgrade: websocket). Drain it completely without
-    forwarding to SSH (SSH would reject raw HTTP text and die).
-
-    Returns any non-HTTP leftover bytes (real SSH client data).
+    Drain the CF-RAY / second HTTP segment NPV sends after seeing 101.
+    Returns any leftover real data (SSH client hello, etc).
     """
-    buf = initial
-    leftover = b""
-    deadline = time.monotonic() + 5.0  # 5 s total budget
-    sock.settimeout(1.0)
-
+    buf = seed
+    deadline = time.monotonic() + timeout
+    sock.settimeout(1)
     try:
         while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            sock.settimeout(min(1.0, remaining))
-            try:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                buf += chunk
-            except socket.timeout:
-                # If we already have a complete HTTP segment, we're done
-                if b'\r\n\r\n' in buf:
-                    break
-                # If buf is empty or no data yet, keep waiting
-                if not buf:
-                    continue
-                # Partial data but no complete segment — keep waiting
-                continue
-
-            # Check if the accumulated data is HTTP
-            stripped = buf.lstrip()
-            if not stripped:
-                continue
-
-            first_byte = stripped[0]
-            # Real SSH: starts with SSH- banner or binary byte > 0x7f
-            if first_byte > 0x7f or stripped[:4] == b'SSH-':
-                leftover = buf
-                buf = b""
-                break
-
-            # Looks like HTTP — wait for the full segment
+            # If we already have a complete HTTP segment in buf, stop
             if b'\r\n\r\n' in buf:
-                end = buf.index(b'\r\n\r\n')
-                tail = buf[end + 4:]
-                # Tail might be the real SSH client hello — keep it
-                if tail:
-                    # Is tail SSH or more HTTP?
-                    t = tail.lstrip()
-                    if t[:4] == b'SSH-' or (t and t[0] > 0x7f):
-                        leftover = tail
-                    else:
-                        # More HTTP; will be handled in relay (rare)
-                        leftover = tail
-                buf = b""
-                break
-            # Not complete yet — continue reading
+                i = buf.index(b'\r\n\r\n')
+                tail = buf[i+4:]
+                return tail  # might be empty or real SSH data
+            left = deadline - time.monotonic()
+            if left <= 0: break
+            sock.settimeout(min(1.0, left))
+            try:
+                d = sock.recv(4096)
+                if not d: break
+                buf += d
+            except socket.timeout:
+                # No data - if buf is non-empty and looks like SSH, return it
+                if buf and (buf[0] > 0x7f or buf[:4] == b'SSH-'):
+                    return buf
+                if not buf:
+                    break  # nothing coming
+                continue  # keep waiting for \r\n\r\n
+    except Exception: pass
+    # At deadline: return anything that isn't HTTP
+    if buf:
+        s = buf.lstrip()
+        if s and (s[0] > 0x7f or s[:4] == b'SSH-'):
+            return buf
+    return b''
 
-    except Exception:
-        leftover = buf
-    finally:
-        sock.settimeout(TIMEOUT)
-
-    return leftover
-
-
-# ── Connection handler ────────────────────────────────────────────
-
-def handle(client):
+def handle(c):
     ssh = None
     try:
-        client.settimeout(TIMEOUT)
-
-        # Non-destructive peek to detect protocol
-        client.settimeout(5)
+        c.settimeout(8)
+        # Peek first to classify the connection
         try:
-            first = client.recv(4096, socket.MSG_PEEK)
-        except socket.timeout:
-            return
-        finally:
-            client.settimeout(TIMEOUT)
+            peek = c.recv(4096, socket.MSG_PEEK)
+        except Exception: return
+        if not peek: return
 
-        if not first:
-            return
+        p = peek.lstrip()
 
-        # ── Direct SSH ─────────────────────────────────────────────
-        if first.lstrip()[:4] == b'SSH-':
-            ssh = socket.create_connection((SSH_HOST, SSH_PORT), timeout=10)
-            ssh.settimeout(TIMEOUT)
-            relay(client, ssh)
+        # 1) Raw SSH connection (client speaks SSH banner first)
+        if p[:4] == b'SSH-' or (p and p[0] > 0x7f):
+            ssh = socket.create_connection(SSH, 10)
+            c.settimeout(120); ssh.settimeout(120)
+            relay(c, ssh)
             return
 
-        # ── HTTP (any method: GET / POST / CONNECT / CF-RAY / custom)
-        is_http = (b'\r\n' in first[:512] or
-                   b'HTTP'   in first[:32] or
-                   b' / '    in first[:32] or
-                   b'CF-RAY' in first[:32] or
-                   b'CONNECT' in first[:32])
-
-        if is_http:
-            # Step 1: read ONLY the first HTTP segment
-            headers, leftover = read_first_segment(client)
-
-            # Step 2: respond immediately so NPV sends the second segment
-            client.sendall(choose_response(headers))
-
-            # Step 3: drain the second segment (CF-RAY / any) that NPV
-            #         sends right after receiving 101 — never send to SSH
-            real_data = drain_second_segment(client, leftover)
-
-            # Step 4: connect to SSH and start clean relay
-            ssh = socket.create_connection((SSH_HOST, SSH_PORT), timeout=10)
-            ssh.settimeout(TIMEOUT)
-            relay(client, ssh, real_data)
+        # 2) HTTP (any method including CF-RAY, CONNECT, GET, POST...)
+        hdr, leftover = read_seg(c)
+        if not hdr:
             return
 
-        # ── Binary / unknown ───────────────────────────────────────
-        raw = client.recv(BUFFER)
-        ssh = socket.create_connection((SSH_HOST, SSH_PORT), timeout=10)
-        ssh.settimeout(TIMEOUT)
-        relay(client, ssh, raw)
+        # Choose response
+        resp = OK200 if any(hdr.startswith(m) for m in ('CONNECT ',)) else OK101
+        c.sendall(resp)
 
-    except Exception:
-        pass
+        # Drain the second segment NPV sends after receiving 101
+        leftover = drain(c, leftover)
+
+        # Relay to SSH
+        ssh = socket.create_connection(SSH, 10)
+        c.settimeout(120); ssh.settimeout(120)
+        relay(c, ssh, leftover)
+
+    except Exception: pass
     finally:
-        for s in (client, ssh):
-            if s:
-                try:
-                    s.close()
-                except Exception:
-                    pass
-
-
-# ── Server ───────────────────────────────────────────────────────
-
-def make_server(port):
-    if socket.has_ipv6:
-        try:
-            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-            s.bind(('::', port))
-            return s
-        except Exception:
+        for s in filter(None, [c, ssh]):
             try: s.close()
             except Exception: pass
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(('0.0.0.0', port))
-    return s
 
+def main():
+    # Try IPv6 dual-stack, fall back to IPv4
+    for af, addr in ((socket.AF_INET6, '::'), (socket.AF_INET, '0.0.0.0')):
+        if af == socket.AF_INET6 and not socket.has_ipv6:
+            continue
+        try:
+            srv = socket.socket(af, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if af == socket.AF_INET6:
+                srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            srv.bind((addr, LISTEN))
+            break
+        except Exception:
+            try: srv.close()
+            except Exception: pass
+    else:
+        raise RuntimeError(f'Cannot bind to port {LISTEN}')
 
-def serve(port):
-    srv = make_server(port)
-    srv.listen(2048)
-    print(f"[Ragnar-WS v4.2] :{port} -> SSH:{SSH_PORT}", flush=True)
+    srv.listen(1024)
+    print(f'[Ragnar-WS v5] :{LISTEN} -> SSH:22', flush=True)
     while True:
         try:
             c, _ = srv.accept()
             threading.Thread(target=handle, args=(c,), daemon=True).start()
         except Exception as e:
-            print(f"[ERR] {e}", flush=True)
-
+            print(f'[ERR] {e}', flush=True)
 
 if __name__ == '__main__':
-    serve(int(sys.argv[1]) if len(sys.argv) > 1 else 80)
-
+    main()
 PYEOF
     chmod +x /usr/local/bin/ssh-ws-proxy.py
 
-    # Remove WS port from sshd_config if present (fixes existing servers)
-    local SSHD_CFG="/etc/ssh/sshd_config"
-    if grep -q "^Port ${PORT}$" "$SSHD_CFG" 2>/dev/null; then
-        echo -e "  ${YELLOW}[!] Removing Port ${PORT} from sshd (conflicts with WS proxy)...${NC}"
-        sed -i "/^Port ${PORT}$/d" "$SSHD_CFG"
-        systemctl restart ssh >> "$LOG_FILE" 2>&1
-        sleep 1
+    # ── aggressively free the port ────────────────────────────────────
+    echo -e "  ${YELLOW}[*] Freeing port ${PORT}...${NC}"
+
+    # stop common web servers
+    for SVC in nginx apache2 apache lighttpd caddy haproxy h2o; do
+        systemctl stop  "$SVC" 2>/dev/null
+        systemctl disable "$SVC" 2>/dev/null
+    done
+    pkill -9 nginx  2>/dev/null; pkill -9 apache2 2>/dev/null
+    pkill -9 lighttpd 2>/dev/null; pkill -9 caddy 2>/dev/null
+
+    # remove Port $PORT from sshd
+    if grep -q "^Port ${PORT}$" /etc/ssh/sshd_config 2>/dev/null; then
+        sed -i "/^Port ${PORT}$/d" /etc/ssh/sshd_config
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+        echo -e "  ${YELLOW}[!] Removed Port ${PORT} from SSH config${NC}"
     fi
-    # Kill anything already using the WS port
-    local PIDS; PIDS=$(ss -tlnp "sport = :${PORT}" 2>/dev/null | awk 'NR>1{print $NF}' | grep -oP 'pid=\K[0-9]+')
+
+    # kill any remaining process on the port (ss + fuser fallback)
+    local PIDS
+    PIDS=$(ss -tlnp "sport = :${PORT}" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | sort -u)
+    if [[ -z "$PIDS" ]]; then
+        PIDS=$(fuser "${PORT}/tcp" 2>/dev/null)
+    fi
     if [[ -n "$PIDS" ]]; then
-        echo -e "  ${YELLOW}[!] Port ${PORT} in use — clearing...${NC}"
+        echo -e "  ${YELLOW}[!] Killing PIDs on port ${PORT}: ${PIDS}${NC}"
         echo "$PIDS" | xargs -r kill -9 2>/dev/null
-        for SVC in nginx apache2 apache httpd lighttpd; do
-            systemctl stop "$SVC" 2>/dev/null && systemctl disable "$SVC" 2>/dev/null \
-                && echo -e "  ${YELLOW}[!] Stopped ${SVC}${NC}"
-        done
         sleep 1
     fi
 
-    cat > /etc/systemd/system/ssh-ws.service << SVCEOF
+    # verify port is now free
+    if ss -tlnp "sport = :${PORT}" 2>/dev/null | grep -q ":${PORT}"; then
+        echo -e "  ${RED}[!] Port ${PORT} still in use — proxy may fail to bind${NC}"
+    else
+        echo -e "  ${GREEN}[✓] Port ${PORT} is free${NC}"
+    fi
+
+    # check python3 is available
+    if ! command -v python3 &>/dev/null; then
+        echo -e "  ${YELLOW}[!] python3 not found — installing...${NC}"
+        detect_os
+        $PKG_MANAGER install -y python3 >> "$LOG_FILE" 2>&1
+    fi
+
+    # ── systemd service (primary) ─────────────────────────────────────
+    cat > /etc/systemd/system/ssh-ws.service << WSUNIT
 [Unit]
-Description=Ragnar SSH-WebSocket Proxy v4.2 (port ${PORT})
-After=network.target ssh.service
+Description=Ragnar SSH-WebSocket Proxy v5 (port ${PORT})
+After=network.target
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 /usr/local/bin/ssh-ws-proxy.py ${PORT}
 Restart=always
-RestartSec=5
+RestartSec=3
 User=root
 StandardOutput=journal
 StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-SVCEOF
+WSUNIT
 
-    cat > /etc/systemd/system/ssh-wss.service << 'SVCEOF2'
+    # ── systemd service (fallback 8880) ───────────────────────────────
+    cat > /etc/systemd/system/ssh-ws-8880.service << WSUNIT2
 [Unit]
-Description=Ragnar SSH-WebSocket Proxy v4.2 fallback (port 8880)
-After=network.target ssh.service
+Description=Ragnar SSH-WebSocket Proxy v5 fallback (port 8880)
+After=network.target
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 /usr/local/bin/ssh-ws-proxy.py 8880
 Restart=always
-RestartSec=5
+RestartSec=3
 User=root
 StandardOutput=journal
 StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-SVCEOF2
+WSUNIT2
 
     systemctl daemon-reload
-    systemctl enable ssh-ws ssh-wss >> "$LOG_FILE" 2>&1
-    systemctl restart ssh-ws ssh-wss >> "$LOG_FILE" 2>&1
+    systemctl enable  ssh-ws  ssh-ws-8880 >> "$LOG_FILE" 2>&1
+    systemctl restart ssh-ws  ssh-ws-8880
+
+    sleep 2
+    # confirm binding
+    if ss -tlnp "sport = :${PORT}" 2>/dev/null | grep -q python3; then
+        echo -e "  ${GREEN}[✓] Proxy v5 is listening on port ${PORT}${NC}"
+    else
+        echo -e "  ${RED}[!] Proxy not detected on port ${PORT} — check: journalctl -u ssh-ws -n 20${NC}"
+    fi
+    log "WS proxy v5 deployed on port $PORT"
 }
 
-setup_websocket_full() {
-    banner
-    echo -e "${CYAN}  [*] Installing SSH-WebSocket Proxy v3...${NC}\n"
-    echo -ne "  ${YELLOW}WS Port [80]: ${NC}"; read -r WS_PORT
-    WS_PORT=${WS_PORT:-80}
-    deploy_ws_proxy "$WS_PORT"
-    local IP; IP=$(get_public_ip)
-    echo -e "\n  ${GREEN}[✓] WebSocket proxy v3 deployed on port ${WS_PORT}!${NC}"
-    echo -e "  WS URL  : ws://${IP}:${WS_PORT}"
-    echo -e "  WSS URL : ws://${IP}:8880 (fallback)"
-    log "WS proxy v3 installed on port $WS_PORT"
-    read -rp "  Press Enter..."; ws_menu
-}
 
 change_ws_port() {
     banner
