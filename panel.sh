@@ -197,7 +197,7 @@ configure_ssh_safe() {
     local CFG="/etc/ssh/sshd_config"
     cp "$CFG" "${CFG}.backup.$(date +%Y%m%d%H%M%S)" 2>/dev/null
 
-    grep -q "^Port 80$" "$CFG" || echo "Port 80" >> "$CFG"
+    # Port 80 reserved for ssh-ws proxy — NOT added to sshd
 
     sed -i '/^#*PasswordAuthentication/c\PasswordAuthentication yes' "$CFG"
     sed -i '/^#*ChallengeResponseAuthentication/c\ChallengeResponseAuthentication no' "$CFG"
@@ -904,7 +904,7 @@ extend_user() {
         local F1 F2 F3 F4 F5 F6
         IFS='|' read -r F1 F2 F3 F4 F5 F6 <<< "$LINE"
         local NEW_LINE="${F1}|${F2}|${NEW_EXP}|${F4}|${F5}|${F6}"
-        sed -i "s|^${USERNAME}|.*|${NEW_LINE}|" "$USER_DB"
+        sed -i "/^${USERNAME}|/c\\${NEW_LINE}" "$USER_DB"
     fi
 
     echo -e "  ${GREEN}[✓] Extended to ${NEW_EXP}.${NC}"; log "Extended: $USERNAME to $NEW_EXP"
@@ -1143,20 +1143,26 @@ install_web_panel() {
 
     cat > /usr/local/bin/ragnar-web-panel.py << 'WEBEOF'
 #!/usr/bin/env python3
-"""Ragnar Web Panel v3 — browser-based SSH VPN management. No external deps."""
-import os, json, subprocess, time, html
+"""Ragnar Web Panel v3.1 — browser-based SSH VPN management + Web Terminal.
+No external Python deps required (uses only stdlib).
+"""
+import os, json, subprocess, time, html, hashlib, base64
+import struct, select, threading, pty, fcntl, termios
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 import secrets as _sec
 
-PORT     = int(os.environ.get("WEB_PORT", "8080"))
-PASSWORD = os.environ.get("WEB_PASS", "ragnar")
-CONFIG   = "/etc/ssh-vpn-panel"
-USER_DB  = f"{CONFIG}/users.db"
-LOG_FILE = "/var/log/ssh-vpn-panel.log"
+PORT      = int(os.environ.get("WEB_PORT", "8080"))
+PASSWORD  = os.environ.get("WEB_PASS", "ragnar")
+CONFIG    = "/etc/ssh-vpn-panel"
+USER_DB   = f"{CONFIG}/users.db"
+LOG_FILE  = "/var/log/ssh-vpn-panel.log"
 
-TOKENS   = {}   # token -> expiry timestamp
+TOKENS    = {}
 TOKEN_TTL = 3600
+WS_MAGIC  = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+# ── Shell helpers ─────────────────────────────────────────────────
 
 def sh(cmd, t=10):
     try:
@@ -1178,32 +1184,35 @@ def read_users():
             for ln in f:
                 p = ln.strip().split("|")
                 if len(p) >= 6:
-                    u = p[0]
+                    u      = p[0]
                     online = sh(f"who | grep -c '^{u} ' 2>/dev/null || echo 0").split()[0]
-                    lock = sh(f"passwd -S {u} 2>/dev/null | awk '{{print $2}}'")
-                    rows.append(dict(user=u, pw=p[1], exp=p[2], ml=p[3], created=p[4], lock=lock, online=online))
+                    lock   = sh(f"passwd -S {u} 2>/dev/null | awk '{{print $2}}'")
+                    rows.append(dict(user=u, pw=p[1], exp=p[2], ml=p[3],
+                                     created=p[4], lock=lock, online=online))
     except:
         pass
     return rows
 
 def info():
     return dict(
-        ip       = ip_addr(),
-        uptime   = sh("uptime -p"),
-        cpu      = sh("top -bn1 | grep 'Cpu(s)' | awk '{print $2}'"),
-        mem_u    = sh("free -m | awk 'NR==2{print $3}'"),
-        mem_t    = sh("free -m | awk 'NR==2{print $2}'"),
-        disk     = sh("df -h / | awk 'NR==2{print $3\"/\"$2\" (\"$5\")'\"'\"'}"),
-        users    = sh(f"wc -l < {USER_DB}").strip(),
-        online   = sh("who | wc -l").strip(),
-        ssh      = svc("ssh"),
-        ws       = svc("ssh-ws"),
-        tls      = svc("stunnel4"),
-        cf       = svc("cloudflared-tunnel"),
-        web      = svc("ragnar-web"),
-        ws_port  = sh(f"cat {CONFIG}/ws_port.txt 2>/dev/null || echo 80"),
-        cf_dom   = sh(f"cat {CONFIG}/cf_domain.txt 2>/dev/null | sed 's|https://||'"),
+        ip      = ip_addr(),
+        uptime  = sh("uptime -p"),
+        cpu     = sh("top -bn1 | grep 'Cpu(s)' | awk '{print $2}'"),
+        mem_u   = sh("free -m | awk 'NR==2{print $3}'"),
+        mem_t   = sh("free -m | awk 'NR==2{print $2}'"),
+        disk    = sh("df -h / | awk 'NR==2{print $3\"/\"$2\" (\"$5\")'\"'\"'}"),
+        users   = sh(f"wc -l < {USER_DB}").strip(),
+        online  = sh("who | wc -l").strip(),
+        ssh     = svc("ssh"),
+        ws      = svc("ssh-ws"),
+        tls     = svc("stunnel4"),
+        cf      = svc("cloudflared-tunnel"),
+        web     = svc("ragnar-web"),
+        ws_port = sh(f"cat {CONFIG}/ws_port.txt 2>/dev/null || echo 80"),
+        cf_dom  = sh(f"cat {CONFIG}/cf_domain.txt 2>/dev/null | sed 's|https://||'"),
     )
+
+# ── Auth helpers ──────────────────────────────────────────────────
 
 def tok_new():
     t = _sec.token_hex(24)
@@ -1219,10 +1228,129 @@ def tok_ok(t):
     return False
 
 def get_tok(hdrs):
-    for part in hdrs.get("Cookie","").split(";"):
+    for part in hdrs.get("Cookie", "").split(";"):
         k, _, v = part.strip().partition("=")
-        if k.strip() == "rp": return v.strip()
+        if k.strip() == "rp":
+            return v.strip()
     return ""
+
+# ── WebSocket helpers ─────────────────────────────────────────────
+
+def ws_accept_key(key):
+    return base64.b64encode(
+        hashlib.sha1((key + WS_MAGIC).encode()).digest()
+    ).decode()
+
+def ws_recv_frame(sock):
+    try:
+        hdr = b""
+        while len(hdr) < 2:
+            c = sock.recv(2 - len(hdr))
+            if not c: return None
+            hdr += c
+        opcode = hdr[0] & 0x0f
+        if opcode == 8: return None   # close frame
+        masked = (hdr[1] & 0x80) != 0
+        plen   = hdr[1] & 0x7f
+        if plen == 126:
+            ext = b""
+            while len(ext) < 2: ext += sock.recv(2 - len(ext))
+            plen = struct.unpack(">H", ext)[0]
+        elif plen == 127:
+            ext = b""
+            while len(ext) < 8: ext += sock.recv(8 - len(ext))
+            plen = struct.unpack(">Q", ext)[0]
+        mask = sock.recv(4) if masked else b"\x00\x00\x00\x00"
+        data = b""
+        while len(data) < plen:
+            c = sock.recv(min(plen - len(data), 65536))
+            if not c: return None
+            data += c
+        if masked:
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        return data
+    except:
+        return None
+
+def ws_send_frame(sock, data):
+    try:
+        if isinstance(data, str): data = data.encode()
+        l = len(data)
+        if l < 126:      hdr = bytes([0x82, l])
+        elif l < 65536:  hdr = bytes([0x82, 126]) + struct.pack(">H", l)
+        else:            hdr = bytes([0x82, 127]) + struct.pack(">Q", l)
+        sock.sendall(hdr + data)
+        return True
+    except:
+        return False
+
+def handle_terminal_ws(handler):
+    """Upgrade HTTP to WebSocket and proxy to an interactive bash pty."""
+    key    = handler.headers.get("Sec-WebSocket-Key", "")
+    accept = ws_accept_key(key)
+    resp   = (
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+    )
+    sock = handler.connection
+    sock.sendall(resp.encode())
+    sock.settimeout(None)
+
+    master_fd, slave_fd = pty.openpty()
+    proc = subprocess.Popen(
+        ["/bin/bash", "-i"],
+        stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+        close_fds=True,
+        env=dict(os.environ, TERM="xterm-256color", HOME="/root", USER="root")
+    )
+    os.close(slave_fd)
+
+    stop = threading.Event()
+
+    def pty_reader():
+        while not stop.is_set():
+            try:
+                r, _, _ = select.select([master_fd], [], [], 0.5)
+                if r:
+                    data = os.read(master_fd, 4096)
+                    if not data or not ws_send_frame(sock, data):
+                        break
+            except:
+                break
+        stop.set()
+
+    t = threading.Thread(target=pty_reader, daemon=True)
+    t.start()
+
+    while not stop.is_set():
+        data = ws_recv_frame(sock)
+        if data is None:
+            break
+        # Check for resize JSON message
+        try:
+            msg = json.loads(data.decode())
+            if msg.get("type") == "resize":
+                cols    = int(msg.get("cols", 80))
+                rows    = int(msg.get("rows", 24))
+                winsize = struct.pack("HHHH", rows, cols, 0, 0)
+                fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
+            continue
+        except:
+            pass
+        try:
+            os.write(master_fd, data)
+        except:
+            break
+
+    stop.set()
+    try: proc.terminate()
+    except: pass
+    try: os.close(master_fd)
+    except: pass
+
+# ── CSS ───────────────────────────────────────────────────────────
 
 CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1230,8 +1358,11 @@ body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',Arial,sans-serif;fo
 .nav{background:#161b22;border-bottom:1px solid #30363d;padding:14px 24px;display:flex;align-items:center;gap:16px}
 .nav h1{font-size:18px;color:#58a6ff;font-weight:700}
 .nav .sub{color:#8b949e;font-size:13px}
-.nav a{color:#8b949e;text-decoration:none;margin-left:auto;font-size:13px}
-.nav a:hover{color:#58a6ff}
+.nav-links{margin-left:auto;display:flex;gap:12px;align-items:center}
+.nav-links a{color:#8b949e;text-decoration:none;font-size:13px}
+.nav-links a:hover{color:#58a6ff}
+.nav-links a.term{background:#238636;color:#fff;padding:5px 12px;border-radius:6px;font-size:12px;font-weight:600}
+.nav-links a.term:hover{background:#2ea043;color:#fff}
 .wrap{max-width:1100px;margin:0 auto;padding:24px 16px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin-bottom:20px}
 .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:18px}
@@ -1267,181 +1398,331 @@ tr:hover{background:#1c2128}
 .err{color:#f85149;font-size:13px;margin-bottom:11px;text-align:center}
 """
 
+TERM_HTML = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Ragnar Terminal</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:#0d1117;overflow:hidden}
+    .topbar{background:#161b22;border-bottom:1px solid #30363d;padding:10px 20px;
+            display:flex;align-items:center;gap:12px;height:44px}
+    .topbar h1{color:#58a6ff;font-size:15px;font-family:sans-serif;font-weight:700}
+    .topbar a{color:#8b949e;text-decoration:none;font-size:13px;font-family:sans-serif;margin-left:auto}
+    .topbar a:hover{color:#58a6ff}
+    .badge{font-size:12px;font-family:sans-serif;padding:3px 9px;border-radius:4px;
+           background:#238636;color:#fff;font-weight:600}
+    .badge.off{background:#da3633}
+    #terminal{height:calc(100vh - 44px)}
+  </style>
+</head>
+<body>
+<div class="topbar">
+  <h1>&#9889; Ragnar Web Terminal</h1>
+  <span id="badge" class="badge">Connecting...</span>
+  <a href="/">&#8592; Dashboard</a>
+</div>
+<div id="terminal"></div>
+<script>
+const term = new Terminal({
+  theme:{background:'#0d1117',foreground:'#e6edf3',cursor:'#58a6ff',
+         selectionBackground:'#264f78'},
+  fontFamily:'Consolas,"Courier New",monospace',
+  fontSize:14,
+  cursorBlink:true,
+  scrollback:5000,
+});
+const fitAddon = new FitAddon.FitAddon();
+term.loadAddon(fitAddon);
+term.open(document.getElementById('terminal'));
+fitAddon.fit();
+
+const badge = document.getElementById('badge');
+const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const ws    = new WebSocket(proto + '//' + location.host + '/terminal');
+ws.binaryType = 'arraybuffer';
+
+ws.onopen = function() {
+  badge.textContent = 'Connected';
+  badge.className   = 'badge';
+  ws.send(JSON.stringify({type:'resize', cols:term.cols, rows:term.rows}));
+};
+ws.onmessage = function(e) {
+  if (e.data instanceof ArrayBuffer) term.write(new Uint8Array(e.data));
+  else term.write(e.data);
+};
+ws.onclose = function() {
+  badge.textContent = 'Disconnected';
+  badge.className   = 'badge off';
+  term.writeln('\\r\\n\\x1b[31m[Session closed — refresh to reconnect]\\x1b[0m');
+};
+ws.onerror = function() {
+  badge.textContent = 'Error';
+  badge.className   = 'badge off';
+};
+term.onData(function(data) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(data);
+});
+term.onResize(function(sz) {
+  if (ws.readyState === WebSocket.OPEN)
+    ws.send(JSON.stringify({type:'resize', cols:sz.cols, rows:sz.rows}));
+});
+window.addEventListener('resize', function() { fitAddon.fit(); });
+</script>
+</body>
+</html>"""
+
+# ── Render helpers ────────────────────────────────────────────────
+
 def render_login(err=""):
     e = f'<div class="err">{html.escape(err)}</div>' if err else ""
-    return f"""<!DOCTYPE html><html><head><meta charset=utf-8><title>Ragnar Panel</title><style>{CSS}</style></head>
-<body><div class="login"><div class="lbox">
-<h2>Ragnar Panel</h2>{e}
-<form method=POST action=/login>
-<input type=password name=password placeholder="Password" autofocus required>
-<button>Sign In</button></form></div></div></body></html>"""
+    return (
+        f'<!DOCTYPE html><html><head><meta charset=utf-8>'
+        f'<title>Ragnar Panel</title><style>{CSS}</style></head>'
+        f'<body><div class="login"><div class="lbox">'
+        f'<h2>&#9889; Ragnar Panel</h2>{e}'
+        f'<form method=POST action=/login>'
+        f'<input type=password name=password placeholder="Password" autofocus required>'
+        f'<button>Sign In</button></form></div></div></body></html>'
+    )
 
 def badge(s):
-    cls = "ok" if s == "active" else "off"
-    label = "active" if s == "active" else s or "inactive"
+    cls   = "ok" if s == "active" else "off"
+    label = "active" if s == "active" else (s or "inactive")
     return f'<span class="dot {cls}"></span>{label}'
 
 def render_dash(d, users):
     user_rows = ""
     for u in users:
-        lk = "Locked" if u["lock"] in ("L","LK") else "Active"
-        lk_color = "color:#f85149" if u["lock"] in ("L","LK") else "color:#3fb950"
-        user_rows += f"""<tr>
-<td><strong>{html.escape(u['user'])}</strong></td>
-<td>{html.escape(u['exp'])}</td>
-<td>{html.escape(u['created'])}</td>
-<td>{html.escape(u['ml'])}</td>
-<td>{html.escape(str(u['online']))}</td>
-<td style="{lk_color}">{lk}</td>
-<td style="display:flex;gap:5px;flex-wrap:wrap">
-  <form method=POST action=/user/kill style=display:inline>
-    <input type=hidden name=u value="{html.escape(u['user'])}">
-    <button class="btn b-gray" onclick="return confirm('Kill sessions for {html.escape(u[\"user\"])}?')">Kill</button></form>
-  <form method=POST action=/user/lock style=display:inline>
-    <input type=hidden name=u value="{html.escape(u['user'])}">
-    <button class="btn b-gray">Lock/Unlock</button></form>
-  <form method=POST action=/user/delete style=display:inline>
-    <input type=hidden name=u value="{html.escape(u['user'])}">
-    <button class="btn b-red" onclick="return confirm('Delete {html.escape(u[\"user\"])}?')">Delete</button></form>
-</td></tr>"""
+        lk       = "Locked" if u["lock"] in ("L", "LK") else "Active"
+        lk_color = "color:#f85149" if u["lock"] in ("L", "LK") else "color:#3fb950"
+        un = html.escape(u['user'])
+        user_rows += (
+            f'<tr>'
+            f'<td><strong>{un}</strong></td>'
+            f'<td>{html.escape(u["exp"])}</td>'
+            f'<td>{html.escape(u["created"])}</td>'
+            f'<td>{html.escape(u["ml"])}</td>'
+            f'<td>{html.escape(str(u["online"]))}</td>'
+            f'<td style="{lk_color}">{lk}</td>'
+            f'<td style="display:flex;gap:5px;flex-wrap:wrap">'
+            f'<form method=POST action=/user/kill style=display:inline>'
+            f'<input type=hidden name=u value="{un}">'
+            f'<button class="btn b-gray" onclick="return confirm(\'Kill sessions?\')">Kill</button></form>'
+            f'<form method=POST action=/user/lock style=display:inline>'
+            f'<input type=hidden name=u value="{un}">'
+            f'<button class="btn b-gray">Lock/Unlock</button></form>'
+            f'<form method=POST action=/user/delete style=display:inline>'
+            f'<input type=hidden name=u value="{un}">'
+            f'<button class="btn b-red" onclick="return confirm(\'Delete user?\')">Delete</button></form>'
+            f'</td></tr>'
+        )
 
-    svc_html = ""
-    for name, key in [("SSH","ssh"),("WebSocket","ws"),("TLS/Stunnel","tls"),("Cloudflare","cf"),("Web Panel","web")]:
-        svc_html += f'<span>{name} {badge(d[key])}</span>'
-    cf_row = f'<div style="padding:0 18px 10px;color:#8b949e;font-size:12px">Cloudflare: {html.escape(d["cf_dom"])}</div>' if d["cf_dom"] else ""
+    svc_html = "".join(
+        f'<span>{name} {badge(d[key])}</span>'
+        for name, key in [("SSH","ssh"),("WebSocket","ws"),("TLS/Stunnel","tls"),("Cloudflare","cf"),("Web Panel","web")]
+    )
+    cf_row  = (f'<div style="padding:0 18px 10px;color:#8b949e;font-size:12px">'
+               f'Cloudflare: {html.escape(d["cf_dom"])}</div>') if d["cf_dom"] else ""
     log_txt = html.escape(sh(f"tail -n 50 {LOG_FILE}"))
+    no_users = '<tr><td colspan=7 style="text-align:center;color:#8b949e;padding:22px">No users yet</td></tr>'
 
-    return f"""<!DOCTYPE html><html><head><meta charset=utf-8><title>Ragnar Panel</title>
-<style>{CSS}</style><meta http-equiv=refresh content=30></head><body>
-<div class="nav"><h1>Ragnar Web Panel</h1><span class="sub">v3.0.0</span>
-<a href=/logout>Sign Out</a></div>
-<div class="wrap">
+    return (
+        f'<!DOCTYPE html><html><head><meta charset=utf-8><title>Ragnar Panel</title>'
+        f'<style>{CSS}</style><meta http-equiv=refresh content=30></head><body>'
+        f'<div class="nav">'
+        f'<h1>&#9889; Ragnar Web Panel</h1><span class="sub">v3.1.0</span>'
+        f'<div class="nav-links">'
+        f'<a href=/terminal class="term" target=_blank>&#9889; Web Terminal</a>'
+        f'<a href=/logout>Sign Out</a>'
+        f'</div></div>'
+        f'<div class="wrap">'
+        f'<div class="grid">'
+        f'<div class="card"><h3>Server IP</h3>'
+        f'<div class="v" style="font-size:15px">{html.escape(d["ip"])}</div>'
+        f'<div class="s">Uptime: {html.escape(d["uptime"])}</div></div>'
+        f'<div class="card"><h3>VPN Users</h3>'
+        f'<div class="v">{html.escape(d["users"])}</div>'
+        f'<div class="s">{html.escape(d["online"])} online</div></div>'
+        f'<div class="card"><h3>CPU</h3><div class="v">{html.escape(d["cpu"])}%</div></div>'
+        f'<div class="card"><h3>Memory</h3>'
+        f'<div class="v">{html.escape(d["mem_u"])} MB</div>'
+        f'<div class="s">of {html.escape(d["mem_t"])} MB</div></div>'
+        f'<div class="card"><h3>Disk</h3>'
+        f'<div class="v" style="font-size:14px">{html.escape(d["disk"])}</div></div>'
+        f'</div>'
+        f'<div class="panel"><div class="ph"><h2>Services</h2>'
+        f'<div style="display:flex;gap:6px;flex-wrap:wrap">'
+        f'<form method=POST action=/svc/restart><input type=hidden name=svc value=ssh-ws>'
+        f'<button class="btn b-blue">Restart WS</button></form>'
+        f'<form method=POST action=/svc/restart><input type=hidden name=svc value=stunnel4>'
+        f'<button class="btn b-blue">Restart TLS</button></form>'
+        f'<form method=POST action=/svc/restart><input type=hidden name=svc value=cloudflared-tunnel>'
+        f'<button class="btn b-blue">Restart CF</button></form>'
+        f'<form method=POST action=/svc/restart><input type=hidden name=svc value=ssh>'
+        f'<button class="btn b-blue">Restart SSH</button></form>'
+        f'</div></div>'
+        f'<div class="svc-row">{svc_html}</div>'
+        f'{cf_row}</div>'
+        f'<div class="panel"><div class="ph"><h2>Users</h2></div>'
+        f'<form method=POST action=/user/create class="fr">'
+        f'<input name=username placeholder="Username" required>'
+        f'<input name=password type=password placeholder="Password" required>'
+        f'<input name=days placeholder="Days (30)" value="30" style="max-width:90px">'
+        f'<input name=ml placeholder="MaxLogin (2)" value="2" style="max-width:90px">'
+        f'<button class="btn b-green" type=submit>+ Add User</button></form>'
+        f'<table>'
+        f'<tr><th>User</th><th>Expires</th><th>Created</th>'
+        f'<th>MaxLogin</th><th>Online</th><th>Status</th><th>Actions</th></tr>'
+        f'{user_rows or no_users}'
+        f'</table></div>'
+        f'<div class="panel"><div class="ph"><h2>Panel Log</h2></div>'
+        f'<div class="log">{log_txt}</div></div>'
+        f'</div></body></html>'
+    )
 
-<div class="grid">
-  <div class="card"><h3>Server IP</h3><div class="v" style="font-size:15px">{html.escape(d['ip'])}</div><div class="s">Uptime: {html.escape(d['uptime'])}</div></div>
-  <div class="card"><h3>VPN Users</h3><div class="v">{html.escape(d['users'])}</div><div class="s">{html.escape(d['online'])} online</div></div>
-  <div class="card"><h3>CPU</h3><div class="v">{html.escape(d['cpu'])}%</div></div>
-  <div class="card"><h3>Memory</h3><div class="v">{html.escape(d['mem_u'])} MB</div><div class="s">of {html.escape(d['mem_t'])} MB</div></div>
-  <div class="card"><h3>Disk</h3><div class="v" style="font-size:14px">{html.escape(d['disk'])}</div></div>
-</div>
-
-<div class="panel">
-  <div class="ph"><h2>Services</h2>
-  <div style="display:flex;gap:6px;flex-wrap:wrap">
-    <form method=POST action=/svc/restart><input type=hidden name=svc value=ssh-ws><button class="btn b-blue">Restart WS</button></form>
-    <form method=POST action=/svc/restart><input type=hidden name=svc value=stunnel4><button class="btn b-blue">Restart TLS</button></form>
-    <form method=POST action=/svc/restart><input type=hidden name=svc value=cloudflared-tunnel><button class="btn b-blue">Restart CF</button></form>
-    <form method=POST action=/svc/restart><input type=hidden name=svc value=ssh><button class="btn b-blue">Restart SSH</button></form>
-  </div></div>
-  <div class="svc-row">{svc_html}</div>
-  {cf_row}
-</div>
-
-<div class="panel">
-  <div class="ph"><h2>Users</h2></div>
-  <form method=POST action=/user/create class="fr">
-    <input name=username placeholder="Username" required>
-    <input name=password type=password placeholder="Password" required>
-    <input name=days placeholder="Days (30)" value="30" style="max-width:90px">
-    <input name=ml placeholder="MaxLogin (2)" value="2" style="max-width:90px">
-    <button class="btn b-green" type=submit>+ Add User</button>
-  </form>
-  <table>
-    <tr><th>User</th><th>Expires</th><th>Created</th><th>MaxLogin</th><th>Online</th><th>Status</th><th>Actions</th></tr>
-    {user_rows or '<tr><td colspan=7 style="text-align:center;color:#8b949e;padding:22px">No users yet</td></tr>'}
-  </table>
-</div>
-
-<div class="panel">
-  <div class="ph"><h2>Panel Log</h2></div>
-  <div class="log">{log_txt}</div>
-</div>
-
-</div></body></html>"""
+# ── HTTP handler ──────────────────────────────────────────────────
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
+
     def send_html(self, body, status=200, hdrs=None):
         b = body.encode()
         self.send_response(status)
-        self.send_header("Content-Type","text/html; charset=utf-8")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(b)))
-        for k,v in (hdrs or {}).items(): self.send_header(k,v)
-        self.end_headers(); self.wfile.write(b)
+        for k, v in (hdrs or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(b)
+
     def redir(self, to, hdrs=None):
         self.send_response(302)
         self.send_header("Location", to)
-        for k,v in (hdrs or {}).items(): self.send_header(k,v)
+        for k, v in (hdrs or {}).items():
+            self.send_header(k, v)
         self.end_headers()
+
     def body(self):
-        n = int(self.headers.get("Content-Length",0))
+        n = int(self.headers.get("Content-Length", 0))
         return parse_qs(self.rfile.read(n).decode()) if n else {}
-    def authed(self): return tok_ok(get_tok(self.headers))
+
+    def authed(self):
+        return tok_ok(get_tok(self.headers))
 
     def do_GET(self):
         path = urlparse(self.path).path
+
         if path == "/logout":
-            TOKENS.pop(get_tok(self.headers), None); self.redir("/"); return
+            TOKENS.pop(get_tok(self.headers), None)
+            self.redir("/")
+            return
+
         if not self.authed():
-            self.send_html(render_login()); return
+            self.send_html(render_login())
+            return
+
+        if path == "/terminal":
+            if self.headers.get("Upgrade", "").lower() == "websocket":
+                handle_terminal_ws(self)
+            else:
+                self.send_html(TERM_HTML)
+            return
+
         self.send_html(render_dash(info(), read_users()))
 
     def do_POST(self):
         path = urlparse(self.path).path
+
         if path == "/login":
-            pw = self.body().get("password",[""])[0]
+            pw = self.body().get("password", [""])[0]
             if pw == PASSWORD:
                 t = tok_new()
                 self.redir("/", {"Set-Cookie": f"rp={t}; Path=/; HttpOnly; Max-Age={TOKEN_TTL}"})
             else:
                 self.send_html(render_login("Wrong password"))
             return
-        if not self.authed(): self.redir("/"); return
+
+        if not self.authed():
+            self.redir("/")
+            return
+
         p = self.body()
 
         if path == "/svc/restart":
-            svc = p.get("svc",[""])[0]
-            if svc and all(c.isalnum() or c=='-' for c in svc):
-                sh(f"systemctl restart {svc}")
+            s = p.get("svc", [""])[0]
+            if s and all(c.isalnum() or c == '-' for c in s):
+                sh(f"systemctl restart {s}")
 
         elif path == "/user/create":
-            u = p.get("username",[""])[0].strip()
-            pw= p.get("password",[""])[0].strip()
-            d = p.get("days",["30"])[0].strip() or "30"
-            ml= p.get("ml",["2"])[0].strip() or "2"
-            if u and pw and u.replace("_","").isalnum():
-                exp = sh(f"date -d '+{d} days' '+%Y-%m-%d'")
+            u  = p.get("username", [""])[0].strip()
+            pw = p.get("password", [""])[0].strip()
+            d  = p.get("days",    ["30"])[0].strip() or "30"
+            ml = p.get("ml",      ["2"])[0].strip()  or "2"
+            if u and pw and u.replace("_", "").isalnum():
+                exp   = sh(f"date -d '+{d} days' '+%Y-%m-%d'")
+                today = sh("date '+%Y-%m-%d'")
                 sh(f"useradd -M -s /bin/false -e {exp} {u}")
                 sh(f"echo '{u}:{pw}' | chpasswd")
-                today = sh("date '+%Y-%m-%d'")
-                with open(USER_DB,"a") as f: f.write(f"{u}|{pw}|{exp}|{ml}|{today}|active\n")
+                with open(USER_DB, "a") as f:
+                    f.write(f"{u}|{pw}|{exp}|{ml}|{today}|active\n")
 
         elif path == "/user/delete":
-            u = p.get("u",[""])[0].strip()
-            if u and u.replace("_","").isalnum():
-                sh(f"pkill -u {u}"); sh(f"userdel -f {u}")
-                lines = []
+            u = p.get("u", [""])[0].strip()
+            if u and u.replace("_", "").isalnum():
+                sh(f"pkill -u {u} 2>/dev/null")
+                sh(f"userdel -f {u}")
                 try:
-                    with open(USER_DB) as f: lines = [l for l in f if not l.startswith(f"{u}|")]
-                    with open(USER_DB,"w") as f: f.writelines(lines)
-                except: pass
+                    with open(USER_DB) as f:
+                        lines = [l for l in f if not l.startswith(f"{u}|")]
+                    with open(USER_DB, "w") as f:
+                        f.writelines(lines)
+                except:
+                    pass
 
         elif path == "/user/kill":
-            u = p.get("u",[""])[0].strip()
-            if u and u.replace("_","").isalnum(): sh(f"pkill -u {u}")
+            u = p.get("u", [""])[0].strip()
+            if u and u.replace("_", "").isalnum():
+                sh(f"pkill -u {u} 2>/dev/null")
 
         elif path == "/user/lock":
-            u = p.get("u",[""])[0].strip()
-            if u and u.replace("_","").isalnum():
+            u = p.get("u", [""])[0].strip()
+            if u and u.replace("_", "").isalnum():
                 st = sh(f"passwd -S {u} | awk '{{print $2}}'")
-                if st in ("L","LK"): sh(f"passwd -u {u}")
-                else: sh(f"passwd -l {u}"); sh(f"pkill -u {u}")
+                if st in ("L", "LK"):
+                    sh(f"passwd -u {u}")
+                else:
+                    sh(f"passwd -l {u}")
+                    sh(f"pkill -u {u} 2>/dev/null")
 
         self.redir("/")
 
+
+class ThreadedHTTPServer(HTTPServer):
+    """Handle each request in a daemon thread (needed for long-lived WS connections)."""
+    def process_request(self, request, client_address):
+        t = threading.Thread(
+            target=self._handle, args=(request, client_address), daemon=True
+        )
+        t.start()
+
+    def _handle(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            pass
+        finally:
+            self.shutdown_request(request)
+
+
 if __name__ == "__main__":
-    print(f"[Ragnar Web Panel v3] http://0.0.0.0:{PORT}", flush=True)
-    HTTPServer(("0.0.0.0", PORT), H).serve_forever()
+    print(f"[Ragnar Web Panel v3.1] http://0.0.0.0:{PORT}", flush=True)
+    ThreadedHTTPServer(("0.0.0.0", PORT), H).serve_forever()
+
 WEBEOF
     chmod +x /usr/local/bin/ragnar-web-panel.py
 
@@ -1486,7 +1767,7 @@ change_web_port() {
     [[ ! "$NEW_PORT" =~ ^[0-9]+$ ]] && { echo -e "${RED}Invalid.${NC}"; sleep 1; web_panel_menu; return; }
     echo "$NEW_PORT" > "$WEB_PORT_FILE"
     if [[ -f /etc/systemd/system/ragnar-web.service ]]; then
-        sed -i "s/WEB_PORT=.*/WEB_PORT=${NEW_PORT}\"/" /etc/systemd/system/ragnar-web.service
+        sed -i "s|WEB_PORT=.*\\"|WEB_PORT=${NEW_PORT}\\"|" /etc/systemd/system/ragnar-web.service
         systemctl daemon-reload; systemctl restart ragnar-web
     fi
     echo -e "  ${GREEN}[✓] Web panel port changed to ${NEW_PORT}.${NC}"
@@ -1500,7 +1781,7 @@ change_web_password() {
     [[ -z "$NEW_PASS" ]] && { echo -e "${RED}Empty.${NC}"; sleep 1; web_panel_menu; return; }
     echo "$NEW_PASS" > "$WEB_PASS_FILE"; chmod 600 "$WEB_PASS_FILE"
     if [[ -f /etc/systemd/system/ragnar-web.service ]]; then
-        sed -i "s/WEB_PASS=.*/WEB_PASS=${NEW_PASS}\"/" /etc/systemd/system/ragnar-web.service
+        sed -i "s|WEB_PASS=.*\\"|WEB_PASS=${NEW_PASS}\\"|" /etc/systemd/system/ragnar-web.service
         systemctl daemon-reload; systemctl restart ragnar-web
     fi
     echo -e "  ${GREEN}[✓] Password updated.${NC}"
