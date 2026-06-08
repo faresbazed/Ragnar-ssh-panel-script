@@ -85,6 +85,9 @@ main_menu() {
     echo -e "${WHITE}  │ ${GREEN}[7]${WHITE} Show Connection Details           │${NC}"
     echo -e "${WHITE}  │ ${GREEN}[8]${WHITE} System Information                │${NC}"
     echo -e "${WHITE}  │ ${CYAN}[9]${WHITE} Cloudflare Free Domain            │${NC}"
+    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
+    echo -e "${WHITE}  │ ${YELLOW}[U]${WHITE} Update Panel                     │${NC}"
+    echo -e "${WHITE}  │ ${RED}[X]${WHITE} Uninstall Panel                  │${NC}"
     echo -e "${WHITE}  │ ${RED}[0]${WHITE} Exit                             │${NC}"
     echo -e "${WHITE}  └──────────────────────────────────────┘${NC}"
     echo -ne "\n  ${YELLOW}Select option: ${NC}"
@@ -100,6 +103,8 @@ main_menu() {
         7) show_connection_details ;;
         8) system_info ;;
         9) cloudflare_menu ;;
+        u|U) update_panel ;;
+        x|X) uninstall_panel ;;
         0) echo -e "\n${GREEN}Goodbye!${NC}\n"; exit 0 ;;
         *) echo -e "${RED}Invalid option.${NC}"; sleep 1; main_menu ;;
     esac
@@ -1069,6 +1074,109 @@ uninstall_cloudflare() {
     log "cloudflared uninstalled"
     read -rp "  Press Enter to continue..."
     main_menu
+}
+
+update_panel() {
+    banner
+    echo -e "${CYAN}  [*] Update Panel${NC}\n"
+
+    REMOTE_URL="https://raw.githubusercontent.com/faresbazed/Ragnar-ssh-panel-script/main/panel.sh"
+    INSTALL_DIR="/usr/local/ssh-vpn-panel"
+    CURRENT_SCRIPT="$INSTALL_DIR/panel.sh"
+    BACKUP="$INSTALL_DIR/panel.sh.bak"
+
+    echo -e "${YELLOW}  [1/4] Checking for updates...${NC}"
+    NEW_VERSION=$(curl -sSL "$REMOTE_URL" 2>/dev/null | grep 'PANEL_VERSION=' | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+
+    if [[ -z "$NEW_VERSION" ]]; then
+        echo -e "  ${RED}[✗] Could not reach update server. Check your internet connection.${NC}"
+        read -rp "  Press Enter to continue..."
+        main_menu; return
+    fi
+
+    echo -e "  Current version : ${WHITE}${PANEL_VERSION}${NC}"
+    echo -e "  Latest version  : ${WHITE}${NEW_VERSION}${NC}\n"
+
+    if [[ "$NEW_VERSION" == "$PANEL_VERSION" ]]; then
+        echo -e "  ${GREEN}[✓] You are already on the latest version!${NC}"
+        read -rp "  Press Enter to continue..."
+        main_menu; return
+    fi
+
+    echo -e "${YELLOW}  [2/4] Backing up current panel...${NC}"
+    cp "$CURRENT_SCRIPT" "$BACKUP" 2>/dev/null && \
+        echo -e "  ${GREEN}[✓] Backup saved to ${BACKUP}${NC}" || \
+        echo -e "  ${YELLOW}[!] No existing install found, fresh update.${NC}"
+
+    echo -e "${YELLOW}  [3/4] Downloading latest version...${NC}"
+    curl -sSL "$REMOTE_URL" -o "$CURRENT_SCRIPT.tmp"
+
+    if [[ ! -s "$CURRENT_SCRIPT.tmp" ]]; then
+        echo -e "  ${RED}[✗] Download failed. Keeping current version.${NC}"
+        rm -f "$CURRENT_SCRIPT.tmp"
+        read -rp "  Press Enter to continue..."
+        main_menu; return
+    fi
+
+    mv "$CURRENT_SCRIPT.tmp" "$CURRENT_SCRIPT"
+    chmod +x "$CURRENT_SCRIPT"
+
+    echo -e "${YELLOW}  [4/4] Reloading panel...${NC}"
+    echo -e "\n  ${GREEN}[✓] Panel updated to v${NEW_VERSION}!${NC}"
+    log "Panel updated from v${PANEL_VERSION} to v${NEW_VERSION}"
+
+    read -rp "  Press Enter to relaunch..."
+    exec bash "$CURRENT_SCRIPT"
+}
+
+uninstall_panel() {
+    banner
+    echo -e "${RED}  [!] UNINSTALL PANEL${NC}\n"
+    echo -e "${WHITE}  This will remove:"
+    echo -e "  - All panel files and services (SSH-WS, SSH-TLS, Cloudflare)"
+    echo -e "  - The 'vpn' shortcut command"
+    echo -e "  - Panel config and logs"
+    echo -e "${YELLOW}  SSH server itself will NOT be removed.${NC}\n"
+
+    echo -ne "  ${RED}Type 'UNINSTALL' to confirm: ${NC}"
+    read -r CONFIRM
+    if [[ "$CONFIRM" != "UNINSTALL" ]]; then
+        echo -e "  ${YELLOW}Cancelled.${NC}"
+        sleep 1; main_menu; return
+    fi
+
+    echo -e "\n${YELLOW}  [1/6] Stopping Cloudflare tunnel...${NC}"
+    systemctl stop cloudflared-tunnel 2>/dev/null
+    systemctl disable cloudflared-tunnel 2>/dev/null
+    rm -f /etc/systemd/system/cloudflared-tunnel.service
+    rm -f /usr/local/bin/cloudflared
+
+    echo -e "${YELLOW}  [2/6] Stopping SSH-WebSocket services...${NC}"
+    systemctl stop ssh-ws ssh-wss 2>/dev/null
+    systemctl disable ssh-ws ssh-wss 2>/dev/null
+    rm -f /etc/systemd/system/ssh-ws.service
+    rm -f /etc/systemd/system/ssh-wss.service
+    rm -f /usr/local/bin/ssh-ws-proxy.py
+
+    echo -e "${YELLOW}  [3/6] Stopping Stunnel...${NC}"
+    systemctl stop stunnel4 2>/dev/null
+    systemctl disable stunnel4 2>/dev/null
+
+    echo -e "${YELLOW}  [4/6] Reloading systemd...${NC}"
+    systemctl daemon-reload
+
+    echo -e "${YELLOW}  [5/6] Removing panel files and config...${NC}"
+    rm -rf "$CONFIG_DIR"
+    rm -rf /usr/local/ssh-vpn-panel
+    rm -f "$LOG_FILE"
+
+    echo -e "${YELLOW}  [6/6] Removing 'vpn' command...${NC}"
+    rm -f /usr/local/bin/vpn
+
+    echo -e "\n  ${GREEN}[✓] SSH VPN Panel has been fully uninstalled.${NC}"
+    echo -e "  ${WHITE}SSH server is still running. Goodbye!${NC}\n"
+    log "Panel uninstalled"
+    exit 0
 }
 
 check_root
