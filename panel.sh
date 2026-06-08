@@ -252,19 +252,16 @@ deploy_ws_proxy() {
     cat > /usr/local/bin/ssh-ws-proxy.py << 'PYEOF'
 #!/usr/bin/env python3
 """
-Ragnar SSH-WebSocket Proxy v4.1 — Universal NPV Tunnel Handler
+Ragnar SSH-WebSocket Proxy v4.2 — Universal NPV Tunnel Handler
 
-Handles: GET, POST, CONNECT, CF-RAY, any custom HTTP method, raw SSH, binary.
+Key fix (v4.2):
+  NPV Tunnel ONLY sends the CF-RAY second segment AFTER receiving 101.
+  Previous versions waited 3s for Seg2 before sending 101 — deadlock!
+  Now: send 101 immediately, then drain Seg2 with 5s rolling timeout.
 
-NPV Tunnel payload flow supported:
-  Segment 1:  GET / HTTP/1.1\r\nHost: fake.host\r\n\r\n
-  Segment 2:  CF-RAY / HTTP/1.1\r\nHost: [host]\r\nUpgrade: websocket\r\n...\r\n\r\n
-
-Key improvements over v4:
-  - Phase-2 reader loops until second \\r\\n\\r\\n arrives (not just one recv)
-  - 3 s rolling deadline for the second segment
-  - Post-response drain loops until no more HTTP bytes arrive
-  - Explicit CF-RAY detection in choose_response for clarity
+Flow:
+  NPV → Seg1 (GET / ...) → Proxy sends 101 → NPV sends Seg2 (CF-RAY ...)
+  → Proxy drains Seg2 silently → SSH relay begins cleanly
 """
 import socket, threading, select, sys, time
 
@@ -298,7 +295,6 @@ def pipe(src, dst, stop):
 
 
 def relay(client, ssh, initial=b""):
-    """Start bidirectional pipe; send initial bytes to SSH first."""
     try:
         if initial:
             ssh.sendall(initial)
@@ -310,27 +306,17 @@ def relay(client, ssh, initial=b""):
     stop.wait()
 
 
-# ── HTTP payload reader ───────────────────────────────────────────
+# ── Read first HTTP segment only ──────────────────────────────────
 
-def read_http_request(sock):
+def read_first_segment(sock):
     """
-    Read the complete HTTP request from an NPV Tunnel client.
+    Read exactly ONE complete HTTP segment (up to the first \\r\\n\\r\\n).
+    Returns (headers_text, leftover_bytes)
 
-    NPV sends a two-segment payload:
-      Segment 1  — GET or HEAD (may have no Upgrade header)
-      Segment 2  — CF-RAY or repeat GET with Upgrade: websocket
-
-    Algorithm:
-      Phase 1: loop until first \\r\\n\\r\\n (5 s timeout)
-      Phase 2: loop with rolling 3 s deadline until second \\r\\n\\r\\n
-               (handles slow clients that trickle the second segment)
-      Phase 3: try 1 s for a rare third segment
-
-    Returns (all_headers_text, leftover_bytes_after_last_terminator)
+    We do NOT wait for segment 2 here — NPV won't send it until after
+    we respond with 101. Waiting here causes a deadlock.
     """
     buf = b""
-
-    # Phase 1 ─ get first complete segment
     sock.settimeout(5)
     try:
         while b'\r\n\r\n' not in buf and len(buf) < 65536:
@@ -340,16 +326,41 @@ def read_http_request(sock):
             buf += chunk
     except socket.timeout:
         pass
-
-    if b'\r\n\r\n' not in buf:
+    finally:
         sock.settimeout(TIMEOUT)
-        return buf.decode('utf-8', errors='ignore'), b""
 
-    # Phase 2 ─ wait for second segment (rolling 3 s deadline)
-    deadline = time.monotonic() + 3.0
+    if b'\r\n\r\n' in buf:
+        end  = buf.index(b'\r\n\r\n')
+        return buf[:end].decode('utf-8', errors='ignore'), buf[end + 4:]
+    return buf.decode('utf-8', errors='ignore'), b""
+
+
+# ── Response chooser ─────────────────────────────────────────────
+
+def choose_response(headers):
+    for line in headers.splitlines():
+        if line.strip().upper().startswith('CONNECT '):
+            return CONNECT_200
+    return WS_101
+
+
+# ── Drain second HTTP segment (CF-RAY / GET / any) ───────────────
+
+def drain_second_segment(sock, initial=b""):
+    """
+    After sending 101, NPV immediately sends the second segment (CF-RAY /
+    or another GET with Upgrade: websocket). Drain it completely without
+    forwarding to SSH (SSH would reject raw HTTP text and die).
+
+    Returns any non-HTTP leftover bytes (real SSH client data).
+    """
+    buf = initial
+    leftover = b""
+    deadline = time.monotonic() + 5.0  # 5 s total budget
     sock.settimeout(1.0)
+
     try:
-        while time.monotonic() < deadline and buf.count(b'\r\n\r\n') < 2:
+        while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -360,84 +371,49 @@ def read_http_request(sock):
                     break
                 buf += chunk
             except socket.timeout:
+                # If we already have a complete HTTP segment, we're done
+                if b'\r\n\r\n' in buf:
+                    break
+                # If buf is empty or no data yet, keep waiting
+                if not buf:
+                    continue
+                # Partial data but no complete segment — keep waiting
+                continue
+
+            # Check if the accumulated data is HTTP
+            stripped = buf.lstrip()
+            if not stripped:
+                continue
+
+            first_byte = stripped[0]
+            # Real SSH: starts with SSH- banner or binary byte > 0x7f
+            if first_byte > 0x7f or stripped[:4] == b'SSH-':
+                leftover = buf
+                buf = b""
                 break
+
+            # Looks like HTTP — wait for the full segment
+            if b'\r\n\r\n' in buf:
+                end = buf.index(b'\r\n\r\n')
+                tail = buf[end + 4:]
+                # Tail might be the real SSH client hello — keep it
+                if tail:
+                    # Is tail SSH or more HTTP?
+                    t = tail.lstrip()
+                    if t[:4] == b'SSH-' or (t and t[0] > 0x7f):
+                        leftover = tail
+                    else:
+                        # More HTTP; will be handled in relay (rare)
+                        leftover = tail
+                buf = b""
+                break
+            # Not complete yet — continue reading
+
     except Exception:
-        pass
-
-    # Phase 3 ─ optional third segment (rare)
-    if buf.count(b'\r\n\r\n') >= 2:
-        sock.settimeout(1.0)
-        try:
-            chunk = sock.recv(4096)
-            if chunk:
-                buf += chunk
-        except socket.timeout:
-            pass
-
-    sock.settimeout(TIMEOUT)
-
-    last_end = buf.rfind(b'\r\n\r\n')
-    if last_end >= 0:
-        headers  = buf[:last_end].decode('utf-8', errors='ignore')
-        leftover = buf[last_end + 4:]
-    else:
-        headers  = buf.decode('utf-8', errors='ignore')
-        leftover = b""
-    return headers, leftover
-
-
-# ── Response chooser ─────────────────────────────────────────────
-
-def choose_response(headers):
-    """
-    CONNECT                  -> 200 Connection established
-    Upgrade: websocket       -> 101 Switching Protocols
-    CF-RAY / any custom      -> 101 Switching Protocols  (default)
-    POST / GET without WS    -> 101 Switching Protocols  (default)
-    """
-    for line in headers.splitlines():
-        stripped = line.strip()
-        if stripped.upper().startswith('CONNECT '):
-            return CONNECT_200
-    return WS_101
-
-
-# ── Drain late HTTP bytes ─────────────────────────────────────────
-
-def drain_late_http(sock):
-    """
-    After sending 101/200, absorb stale HTTP bytes NPV may send late.
-    Loops until timeout or the data looks like real SSH.
-    Returns any actual SSH handshake bytes that arrived.
-    """
-    leftover = b""
-    sock.settimeout(0.8)
-    try:
-        while True:
-            try:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                # Real SSH handshake starts with SSH- banner or binary > 0x7f
-                if chunk.lstrip().startswith(b'SSH-') or chunk[0] > 0x7f:
-                    leftover += chunk
-                    break
-                # Stale HTTP — contains \r\n but isn't SSH
-                if b'\r\n' in chunk[:256]:
-                    end = chunk.find(b'\r\n\r\n')
-                    if end >= 0:
-                        tail = chunk[end + 4:]
-                        if tail:
-                            leftover += tail
-                    # else: all HTTP, discard
-                else:
-                    # Ambiguous — keep it
-                    leftover += chunk
-                    break
-            except socket.timeout:
-                break
+        leftover = buf
     finally:
         sock.settimeout(TIMEOUT)
+
     return leftover
 
 
@@ -448,7 +424,7 @@ def handle(client):
     try:
         client.settimeout(TIMEOUT)
 
-        # Non-destructive peek to detect the protocol
+        # Non-destructive peek to detect protocol
         client.settimeout(5)
         try:
             first = client.recv(4096, socket.MSG_PEEK)
@@ -460,32 +436,38 @@ def handle(client):
         if not first:
             return
 
-        # ── Direct SSH (client speaks SSH-2.0 banner immediately) ──
+        # ── Direct SSH ─────────────────────────────────────────────
         if first.lstrip()[:4] == b'SSH-':
             ssh = socket.create_connection((SSH_HOST, SSH_PORT), timeout=10)
             ssh.settimeout(TIMEOUT)
             relay(client, ssh)
             return
 
-        # ── Any HTTP request (GET / POST / CONNECT / CF-RAY / custom) ──
+        # ── HTTP (any method: GET / POST / CONNECT / CF-RAY / custom)
         is_http = (b'\r\n' in first[:512] or
-                   b'HTTP' in first[:32]  or
-                   b' / ' in first[:32]   or
-                   b'CF-RAY' in first[:32])
+                   b'HTTP'   in first[:32] or
+                   b' / '    in first[:32] or
+                   b'CF-RAY' in first[:32] or
+                   b'CONNECT' in first[:32])
+
         if is_http:
-            headers, leftover = read_http_request(client)
+            # Step 1: read ONLY the first HTTP segment
+            headers, leftover = read_first_segment(client)
+
+            # Step 2: respond immediately so NPV sends the second segment
             client.sendall(choose_response(headers))
 
-            late = drain_late_http(client)
-            if late:
-                leftover += late
+            # Step 3: drain the second segment (CF-RAY / any) that NPV
+            #         sends right after receiving 101 — never send to SSH
+            real_data = drain_second_segment(client, leftover)
 
+            # Step 4: connect to SSH and start clean relay
             ssh = socket.create_connection((SSH_HOST, SSH_PORT), timeout=10)
             ssh.settimeout(TIMEOUT)
-            relay(client, ssh, leftover)
+            relay(client, ssh, real_data)
             return
 
-        # ── Binary / unknown — pipe straight to SSH ──
+        # ── Binary / unknown ───────────────────────────────────────
         raw = client.recv(BUFFER)
         ssh = socket.create_connection((SSH_HOST, SSH_PORT), timeout=10)
         ssh.settimeout(TIMEOUT)
@@ -505,7 +487,6 @@ def handle(client):
 # ── Server ───────────────────────────────────────────────────────
 
 def make_server(port):
-    """IPv6 dual-stack preferred (covers both 0.0.0.0 and :: in one socket)."""
     if socket.has_ipv6:
         try:
             s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
@@ -525,7 +506,7 @@ def make_server(port):
 def serve(port):
     srv = make_server(port)
     srv.listen(2048)
-    print(f"[Ragnar-WS v4.1] :{port} -> SSH:{SSH_PORT}", flush=True)
+    print(f"[Ragnar-WS v4.2] :{port} -> SSH:{SSH_PORT}", flush=True)
     while True:
         try:
             c, _ = srv.accept()
@@ -562,7 +543,7 @@ PYEOF
 
     cat > /etc/systemd/system/ssh-ws.service << SVCEOF
 [Unit]
-Description=Ragnar SSH-WebSocket Proxy v4.1 (port ${PORT})
+Description=Ragnar SSH-WebSocket Proxy v4.2 (port ${PORT})
 After=network.target ssh.service
 
 [Service]
@@ -580,7 +561,7 @@ SVCEOF
 
     cat > /etc/systemd/system/ssh-wss.service << 'SVCEOF2'
 [Unit]
-Description=Ragnar SSH-WebSocket Proxy v4.1 fallback (port 8880)
+Description=Ragnar SSH-WebSocket Proxy v4.2 fallback (port 8880)
 After=network.target ssh.service
 
 [Service]
