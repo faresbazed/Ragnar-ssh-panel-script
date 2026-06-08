@@ -1,10 +1,11 @@
 #!/bin/bash
-# ============================================================
-#   SSH VPN PANEL — NPV Tunnel Ready
-#   Supports: SSH-WS (80/443), SSH-TLS (443), Multi-port SSH
-#             Cloudflare Free Domain (trycloudflare.com)
-#   Compatible with: NPV Tunnel, HTTP Injector, and similar
-# ============================================================
+# ================================================================
+#   RAGNAR SSH VPN PANEL v2.0.0
+#   NPV Tunnel Optimized
+#   Features: SSH-WS | SSH-TLS | Cloudflare | User Mgmt
+#             Auto-Expiry | Conn Limits | Payload Config
+#             Backup/Restore | Live Monitor | Log Viewer
+# ================================================================
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -12,920 +13,500 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 WHITE='\033[1;37m'
+PURPLE='\033[0;35m'
 NC='\033[0m'
+BOLD='\033[1m'
 
-PANEL_VERSION="1.1.0"
+PANEL_VERSION="2.0.0"
+REPO_RAW="https://raw.githubusercontent.com/faresbazed/Ragnar-ssh-panel-script/main"
 CONFIG_DIR="/etc/ssh-vpn-panel"
 USER_DB="$CONFIG_DIR/users.db"
 LOG_FILE="/var/log/ssh-vpn-panel.log"
 CF_DOMAIN_FILE="$CONFIG_DIR/cf_domain.txt"
+PAYLOAD_FILE="$CONFIG_DIR/payload.txt"
+INSTALL_DIR="/usr/local/ssh-vpn-panel"
+WS_PORT_FILE="$CONFIG_DIR/ws_port.txt"
 
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
-}
+# ── Helpers ──────────────────────────────────────────────────────
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
 
 check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}[ERROR] This script must be run as root.${NC}"
-        exit 1
-    fi
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Run as root.${NC}"; exit 1; }
 }
 
 init_panel() {
-    mkdir -p "$CONFIG_DIR"
-    touch "$USER_DB"
-    touch "$LOG_FILE"
+    mkdir -p "$CONFIG_DIR" "$INSTALL_DIR"
+    touch "$USER_DB" "$LOG_FILE"
+    [[ ! -f "$WS_PORT_FILE" ]] && echo "80" > "$WS_PORT_FILE"
+    [[ ! -f "$PAYLOAD_FILE" ]] && echo "GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]" > "$PAYLOAD_FILE"
+    setup_expiry_cron
 }
 
 detect_os() {
-    if [ -f /etc/debian_version ]; then
-        OS="debian"
-        PKG_MANAGER="apt-get"
-    elif [ -f /etc/redhat-release ]; then
-        OS="redhat"
-        PKG_MANAGER="yum"
-    else
-        OS="unknown"
-        PKG_MANAGER="apt-get"
-    fi
+    if   [[ -f /etc/debian_version ]]; then PKG_MANAGER="apt-get"; OS="debian"
+    elif [[ -f /etc/redhat-release ]]; then PKG_MANAGER="yum";     OS="redhat"
+    else                                    PKG_MANAGER="apt-get"; OS="unknown"; fi
 }
 
 get_public_ip() {
-    PUBLIC_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || \
-                curl -s --max-time 5 https://ifconfig.me 2>/dev/null || \
-                echo "Unknown")
-    echo "$PUBLIC_IP"
+    curl -s --max-time 5 https://api.ipify.org 2>/dev/null || \
+    curl -s --max-time 5 https://ifconfig.me   2>/dev/null || \
+    echo "Unknown"
 }
+
+svc_status() {
+    systemctl is-active --quiet "$1" 2>/dev/null && echo -e "${GREEN}●${NC}" || echo -e "${RED}●${NC}"
+}
+
+get_ws_port() { cat "$WS_PORT_FILE" 2>/dev/null || echo "80"; }
+
+# ── Banner ───────────────────────────────────────────────────────
 
 banner() {
     clear
-    IP=$(get_public_ip)
+    local IP; IP=$(get_public_ip)
+    local WS_P; WS_P=$(get_ws_port)
+    local CF_DOM; CF_DOM=$(cat "$CF_DOMAIN_FILE" 2>/dev/null | sed 's|https://||' || echo "Not set")
+    local S_SSH; S_SSH=$(svc_status ssh)
+    local S_WS;  S_WS=$(svc_status ssh-ws)
+    local S_TLS; S_TLS=$(svc_status stunnel4)
+    local S_CF;  S_CF=$(svc_status cloudflared-tunnel)
     echo -e "${CYAN}"
-    echo "  ╔══════════════════════════════════════════════════════╗"
-    echo "  ║          SSH VPN PANEL  v${PANEL_VERSION}                      ║"
-    echo "  ║      NPV Tunnel / HTTP Injector Compatible           ║"
-    echo "  ╠══════════════════════════════════════════════════════╣"
-    echo -e "  ║  Server IP : ${WHITE}${IP}${CYAN}                                 "
-    echo -e "  ║  Date/Time : ${WHITE}$(date '+%Y-%m-%d %H:%M:%S')${CYAN}                    "
-    echo "  ╚══════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
+    echo "  ╔══════════════════════════════════════════════════════════╗"
+    printf "  ║  %bRAGNAR SSH VPN PANEL%b %-6s %30s ║\n" "$BOLD$WHITE" "$CYAN" "v${PANEL_VERSION}" ""
+    echo "  ╠══════════════════════════════════════════════════════════╣"
+    printf "  ║  IP  : %-20s  Date: %-20s║\n" "${WHITE}${IP}${CYAN}" "${WHITE}$(date '+%d/%m/%y %H:%M:%S')${CYAN}"
+    printf "  ║  WS  : %-6s  TLS: %-6s  CF: %-6s  SSH: %-12s║\n" \
+        "$(get_ws_port)" "443" "${CF_DOM:0:18}" "22"
+    printf "  ║  %b SSH %b%b WS %b%b TLS %b%b CF %b   Services Status              ║\n" \
+        "$NC" "$S_SSH" "$NC" "$S_WS" "$NC" "$S_TLS" "$NC" "$S_CF" 
+    echo -e "  ╚══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
 }
+
+# ── Main Menu ────────────────────────────────────────────────────
 
 main_menu() {
     banner
-    echo -e "${WHITE}  ┌──────────────────────────────────────┐${NC}"
-    echo -e "${WHITE}  │           MAIN MENU                  │${NC}"
-    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[1]${WHITE} Install SSH Services              │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[2]${WHITE} SSH-WebSocket Setup (WS/WSS)      │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[3]${WHITE} SSH-TLS Setup (Stunnel)           │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[4]${WHITE} User Management                  │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[5]${WHITE} Port Management                  │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[6]${WHITE} Monitor Connections               │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[7]${WHITE} Show Connection Details           │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[8]${WHITE} System Information                │${NC}"
-    echo -e "${WHITE}  │ ${CYAN}[9]${WHITE} Cloudflare Free Domain            │${NC}"
-    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
+    echo -e "${WHITE}  ┌──────────────────────────────────────────┐${NC}"
+    echo -e "${WHITE}  │           NPV TUNNEL PANEL               │${NC}"
+    echo -e "${WHITE}  ├──────────────────────────────────────────┤${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[1]${WHITE} Full Setup (Install Everything)    │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[2]${WHITE} SSH-WebSocket (WS/WSS)            │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[3]${WHITE} SSH-TLS (Stunnel port 443)        │${NC}"
+    echo -e "${WHITE}  │ ${CYAN}[4]${WHITE} Cloudflare Free Domain            │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[5]${WHITE} Payload Configurator              │${NC}"
+    echo -e "${WHITE}  ├──────────────────────────────────────────┤${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[6]${WHITE} User Management                  │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[7]${WHITE} Live Connection Monitor           │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[8]${WHITE} Connection Details (NPV Config)   │${NC}"
+    echo -e "${WHITE}  ├──────────────────────────────────────────┤${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[9]${WHITE} Service Control                  │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[L]${WHITE} Log Viewer                       │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[B]${WHITE} Backup / Restore                 │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[I]${WHITE} System Info                      │${NC}"
+    echo -e "${WHITE}  ├──────────────────────────────────────────┤${NC}"
     echo -e "${WHITE}  │ ${YELLOW}[U]${WHITE} Update Panel                     │${NC}"
     echo -e "${WHITE}  │ ${RED}[X]${WHITE} Uninstall Panel                  │${NC}"
     echo -e "${WHITE}  │ ${RED}[0]${WHITE} Exit                             │${NC}"
-    echo -e "${WHITE}  └──────────────────────────────────────┘${NC}"
-    echo -ne "\n  ${YELLOW}Select option: ${NC}"
-    read -r OPTION
-
-    case $OPTION in
-        1) install_ssh_services ;;
-        2) setup_websocket ;;
+    echo -e "${WHITE}  └──────────────────────────────────────────┘${NC}"
+    echo -ne "\n  ${YELLOW}Select: ${NC}"
+    read -r OPT
+    case ${OPT,,} in
+        1) full_setup ;;
+        2) ws_menu ;;
         3) setup_stunnel ;;
-        4) user_management_menu ;;
-        5) port_management_menu ;;
-        6) monitor_connections ;;
-        7) show_connection_details ;;
-        8) system_info ;;
-        9) cloudflare_menu ;;
-        u|U) update_panel ;;
-        x|X) uninstall_panel ;;
+        4) cloudflare_menu ;;
+        5) payload_configurator ;;
+        6) user_management_menu ;;
+        7) monitor_connections ;;
+        8) show_connection_details ;;
+        9) service_control_menu ;;
+        l) log_viewer ;;
+        b) backup_restore_menu ;;
+        i) system_info ;;
+        u) update_panel ;;
+        x) uninstall_panel ;;
         0) echo -e "\n${GREEN}Goodbye!${NC}\n"; exit 0 ;;
-        *) echo -e "${RED}Invalid option.${NC}"; sleep 1; main_menu ;;
+        *) echo -e "${RED}Invalid.${NC}"; sleep 1; main_menu ;;
     esac
 }
 
-install_ssh_services() {
+# ── [1] Full Setup ───────────────────────────────────────────────
+
+full_setup() {
     banner
-    echo -e "${CYAN}  [*] Installing SSH Services...${NC}\n"
+    echo -e "${CYAN}  [*] Full NPV Tunnel Setup${NC}\n"
     detect_os
 
-    echo -e "${YELLOW}  [1/5] Updating package lists...${NC}"
+    echo -e "${YELLOW}  [1/6] Updating packages...${NC}"
     $PKG_MANAGER update -y >> "$LOG_FILE" 2>&1
 
-    echo -e "${YELLOW}  [2/5] Installing OpenSSH Server...${NC}"
-    $PKG_MANAGER install -y openssh-server >> "$LOG_FILE" 2>&1
+    echo -e "${YELLOW}  [2/6] Installing dependencies...${NC}"
+    $PKG_MANAGER install -y openssh-server curl wget python3 python3-pip \
+        stunnel4 net-tools iptables openssl cron >> "$LOG_FILE" 2>&1
 
-    echo -e "${YELLOW}  [3/5] Installing required tools...${NC}"
-    $PKG_MANAGER install -y curl wget python3 python3-pip stunnel4 netcat-openbsd \
-        net-tools iptables fail2ban >> "$LOG_FILE" 2>&1
+    echo -e "${YELLOW}  [3/6] Configuring SSH (safe, preserves your ports)...${NC}"
+    configure_ssh_safe
 
-    echo -e "${YELLOW}  [4/5] Configuring SSH server...${NC}"
-    configure_ssh
+    echo -e "${YELLOW}  [4/6] Setting up SSH-WebSocket on port 80...${NC}"
+    deploy_ws_proxy 80
 
-    echo -e "${YELLOW}  [5/5] Starting SSH service...${NC}"
-    systemctl enable ssh >> "$LOG_FILE" 2>&1
-    systemctl restart ssh >> "$LOG_FILE" 2>&1
+    echo -e "${YELLOW}  [5/6] Setting up SSH-TLS (Stunnel) on port 443...${NC}"
+    deploy_stunnel_silent
 
-    echo -e "\n  ${GREEN}[✓] SSH Services installed successfully!${NC}"
-    log "SSH services installed"
+    echo -e "${YELLOW}  [6/6] Setting up auto-expiry cron...${NC}"
+    setup_expiry_cron
+
+    systemctl daemon-reload
+    systemctl enable ssh ssh-ws ssh-wss stunnel4 >> "$LOG_FILE" 2>&1
+    systemctl restart ssh ssh-ws ssh-wss stunnel4 >> "$LOG_FILE" 2>&1
+
+    local IP; IP=$(get_public_ip)
+    echo -e "\n  ${GREEN}[✓] Full setup complete!${NC}"
+    echo -e "\n  ${WHITE}┌──────────────────────────────────────────────────┐"
+    echo -e "  │  NPV Tunnel Settings:                            │"
+    echo -e "  │  SSH Host   : ${IP}"
+    echo -e "  │  SSH Port   : 22"
+    echo -e "  │  WS Host    : ${IP}"
+    echo -e "  │  WS Port    : 80"
+    echo -e "  │  TLS Port   : 443"
+    echo -e "  │  Payload    : $(cat "$PAYLOAD_FILE" 2>/dev/null)"
+    echo -e "  └──────────────────────────────────────────────────┘${NC}"
+    log "Full setup completed"
     read -rp "  Press Enter to continue..."
     main_menu
 }
 
-configure_ssh() {
-    SSHD_CONFIG="/etc/ssh/sshd_config"
+configure_ssh_safe() {
+    local CFG="/etc/ssh/sshd_config"
+    cp "$CFG" "${CFG}.backup.$(date +%Y%m%d%H%M%S)" 2>/dev/null
 
-    # Backup original config — never destroy it
-    cp "$SSHD_CONFIG" "${SSHD_CONFIG}.backup.$(date +%Y%m%d%H%M%S)"
-    echo -e "  ${GREEN}[✓] Backup saved: ${SSHD_CONFIG}.backup.$(date +%Y%m%d%H%M%S)${NC}"
-
-    # Add extra ports only if not already present (preserves existing ports like 22022)
-    for ADD_PORT in 80 443; do
-        if ! grep -q "^Port ${ADD_PORT}$" "$SSHD_CONFIG"; then
-            echo "Port ${ADD_PORT}" >> "$SSHD_CONFIG"
-            echo -e "  ${GREEN}[✓] Added Port ${ADD_PORT}${NC}"
-        fi
+    # Only ADD ports 80/443 if not already there — never remove existing ports
+    for P in 80 443; do
+        grep -q "^Port ${P}$" "$CFG" || echo "Port ${P}" >> "$CFG"
     done
 
-    # Enable password auth and root login safely (only set if missing/disabled)
-    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' "$SSHD_CONFIG"
-    sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' "$SSHD_CONFIG"
-    sed -i 's/^#*ClientAliveInterval.*/ClientAliveInterval 60/' "$SSHD_CONFIG"
-    sed -i 's/^#*ClientAliveCountMax.*/ClientAliveCountMax 3/' "$SSHD_CONFIG"
-    sed -i 's/^#*MaxSessions.*/MaxSessions 10/' "$SSHD_CONFIG"
+    # Safe sed — won't duplicate lines
+    sed -i '/^#*PasswordAuthentication/c\PasswordAuthentication yes' "$CFG"
+    sed -i '/^#*ChallengeResponseAuthentication/c\ChallengeResponseAuthentication no' "$CFG"
+    sed -i '/^#*ClientAliveInterval/c\ClientAliveInterval 60' "$CFG"
+    sed -i '/^#*ClientAliveCountMax/c\ClientAliveCountMax 3' "$CFG"
+    sed -i '/^#*MaxSessions/c\MaxSessions 50' "$CFG"
 
-    # If settings don't exist at all, append them
-    grep -q "^PermitRootLogin" "$SSHD_CONFIG"    || echo "PermitRootLogin yes"    >> "$SSHD_CONFIG"
-    grep -q "^PasswordAuthentication" "$SSHD_CONFIG" || echo "PasswordAuthentication yes" >> "$SSHD_CONFIG"
+    grep -q "^PasswordAuthentication"  "$CFG" || echo "PasswordAuthentication yes"  >> "$CFG"
+    grep -q "^ClientAliveInterval"     "$CFG" || echo "ClientAliveInterval 60"     >> "$CFG"
+    grep -q "^MaxSessions"             "$CFG" || echo "MaxSessions 50"             >> "$CFG"
 
-    cat > /etc/ssh/banner << 'BANNER'
-##############################################
-#         Welcome to SSH VPN Server         #
-#          Powered by NPV Tunnel            #
-##############################################
-BANNER
-
-    # Add banner only if not already set
-    grep -q "^Banner" "$SSHD_CONFIG" || echo "Banner /etc/ssh/banner" >> "$SSHD_CONFIG"
-
+    cat > /etc/ssh/banner << 'BNRTXT'
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  RAGNAR VPN SERVER — NPV Tunnel
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BNRTXT
+    grep -q "^Banner" "$CFG" || echo "Banner /etc/ssh/banner" >> "$CFG"
     systemctl restart ssh >> "$LOG_FILE" 2>&1
-    PORTS=$(grep "^Port" "$SSHD_CONFIG" | awk '{print $2}' | tr '\n' ',' | sed 's/,$//')
-    echo -e "  ${GREEN}[✓] SSH active on ports: ${PORTS}${NC}"
 }
 
-setup_websocket() {
+# ── [2] WebSocket Menu ───────────────────────────────────────────
+
+ws_menu() {
     banner
-    echo -e "${CYAN}  [*] SSH WebSocket Setup${NC}\n"
-    echo -e "${WHITE}  SSH-WS allows SSH tunneling over WebSocket protocol"
-    echo -e "  Compatible with NPV Tunnel, HTTP Injector, etc.${NC}\n"
+    local WS_P; WS_P=$(get_ws_port)
+    echo -e "${WHITE}  ┌──────────────────────────────────────┐${NC}"
+    echo -e "${WHITE}  │        SSH WEBSOCKET (NPV WS)        │${NC}"
+    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
+    echo -e "${WHITE}  │  Current WS Port : ${CYAN}${WS_P}${WHITE}"
+    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[1]${WHITE} Install / Reinstall WS Proxy     │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[2]${WHITE} Change WS Port                   │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[3]${WHITE} Restart WS Service               │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[4]${WHITE} View WS Logs                     │${NC}"
+    echo -e "${WHITE}  │ ${RED}[0]${WHITE} Back                             │${NC}"
+    echo -e "${WHITE}  └──────────────────────────────────────┘${NC}"
+    echo -ne "\n  ${YELLOW}Select: ${NC}"; read -r OPT
+    case $OPT in
+        1) setup_websocket_full ;;
+        2) change_ws_port ;;
+        3) systemctl restart ssh-ws ssh-wss; echo -e "  ${GREEN}[✓] Restarted.${NC}"; sleep 1; ws_menu ;;
+        4) journalctl -u ssh-ws -n 30 --no-pager; read -rp "  Enter to continue..."; ws_menu ;;
+        0) main_menu ;;
+        *) ws_menu ;;
+    esac
+}
 
-    echo -e "${YELLOW}  [1/4] Installing Python WebSocket proxy...${NC}"
-    pip3 install websockify >> "$LOG_FILE" 2>&1
+deploy_ws_proxy() {
+    local PORT="${1:-80}"
+    echo "$PORT" > "$WS_PORT_FILE"
 
-    echo -e "${YELLOW}  [2/4] Creating WebSocket proxy service...${NC}"
-
-    cat > /usr/local/bin/ssh-ws-proxy.py << 'PYWS'
+    cat > /usr/local/bin/ssh-ws-proxy.py << 'PYEOF'
 #!/usr/bin/env python3
 """
-SSH WebSocket Proxy
-Forwards WebSocket connections to local SSH server
+Ragnar SSH-WebSocket Proxy for NPV Tunnel
+Handles: HTTP CONNECT, WebSocket Upgrade, raw TCP
 """
-import socket
-import threading
-import select
-import sys
-import struct
+import socket, threading, select, sys, re, time
 
-LISTEN_PORT_WS = 80     # WS (plain WebSocket)
-LISTEN_PORT_WSS = 8443  # WSS (WebSocket over TLS - stunnel handles TLS)
 SSH_HOST = '127.0.0.1'
 SSH_PORT = 22
-BUFFER = 4096
+BUFFER   = 65536
+TIMEOUT  = 120
 
-RESPONSE = (
+WS_RESPONSE = (
     "HTTP/1.1 101 Switching Protocols\r\n"
     "Upgrade: websocket\r\n"
-    "Connection: Upgrade\r\n\r\n"
+    "Connection: Upgrade\r\n"
+    "Sec-WebSocket-Accept: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
 )
+HTTP_200 = "HTTP/1.1 200 Connection established\r\n\r\n"
+HTTP_400 = "HTTP/1.1 400 Bad Request\r\n\r\n"
 
-def handle_client(client_sock):
+def pipe(src, dst, stop_evt):
     try:
-        data = client_sock.recv(BUFFER).decode('utf-8', errors='ignore')
-        if 'Upgrade: websocket' in data or 'CONNECT' in data:
-            client_sock.send(RESPONSE.encode())
+        while not stop_evt.is_set():
+            r, _, _ = select.select([src], [], [], 5)
+            if not r: continue
+            d = src.recv(BUFFER)
+            if not d: break
+            dst.sendall(d)
+    except Exception: pass
+    stop_evt.set()
 
-        ssh_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        ssh_sock.connect((SSH_HOST, SSH_PORT))
+def handle(client):
+    try:
+        client.settimeout(TIMEOUT)
+        hdr = b""
+        while b"\r\n\r\n" not in hdr:
+            chunk = client.recv(4096)
+            if not chunk: return
+            hdr += chunk
+            if len(hdr) > 8192: break
 
-        def forward(src, dst):
-            try:
-                while True:
-                    r, _, _ = select.select([src], [], [], 60)
-                    if not r:
-                        break
-                    d = src.recv(BUFFER)
-                    if not d:
-                        break
-                    dst.sendall(d)
-            except Exception:
-                pass
-            finally:
-                src.close()
-                dst.close()
+        hdr_str = hdr.decode('utf-8', errors='ignore')
 
-        t1 = threading.Thread(target=forward, args=(client_sock, ssh_sock), daemon=True)
-        t2 = threading.Thread(target=forward, args=(ssh_sock, client_sock), daemon=True)
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
-    except Exception as e:
-        pass
+        # WebSocket Upgrade request
+        if 'Upgrade: websocket' in hdr_str or 'upgrade: websocket' in hdr_str:
+            client.sendall(WS_RESPONSE.encode())
+
+        # HTTP CONNECT method (some NPV Tunnel modes)
+        elif hdr_str.startswith('CONNECT'):
+            client.sendall(HTTP_200.encode())
+
+        # HTTP GET with custom payload (NPV Tunnel inject mode)
+        elif hdr_str.startswith('GET') or hdr_str.startswith('POST'):
+            client.sendall(WS_RESPONSE.encode())
+
+        # Raw TCP — just forward directly
+        # else: pass through
+
+        ssh = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ssh.connect((SSH_HOST, SSH_PORT))
+        ssh.settimeout(TIMEOUT)
+
+        stop = threading.Event()
+        t1 = threading.Thread(target=pipe, args=(client, ssh, stop), daemon=True)
+        t2 = threading.Thread(target=pipe, args=(ssh, client, stop), daemon=True)
+        t1.start(); t2.start()
+        stop.wait()
+        ssh.close()
+    except Exception: pass
     finally:
-        try:
-            client_sock.close()
-        except Exception:
-            pass
+        try: client.close()
+        except Exception: pass
 
-def start_server(port):
+def serve(port):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(('0.0.0.0', port))
-    srv.listen(100)
-    print(f"[SSH-WS] Listening on port {port}")
+    srv.listen(512)
+    print(f"[Ragnar-WS] Listening on :{port} → SSH :{SSH_PORT}", flush=True)
     while True:
         try:
-            client, addr = srv.accept()
-            threading.Thread(target=handle_client, args=(client,), daemon=True).start()
+            c, _ = srv.accept()
+            threading.Thread(target=handle, args=(c,), daemon=True).start()
         except Exception as e:
-            print(f"[ERROR] {e}")
+            print(f"[ERR] {e}", flush=True)
 
 if __name__ == '__main__':
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else LISTEN_PORT_WS
-    start_server(port)
-PYWS
-
+    serve(int(sys.argv[1]) if len(sys.argv) > 1 else 80)
+PYEOF
     chmod +x /usr/local/bin/ssh-ws-proxy.py
 
-    echo -e "${YELLOW}  [3/4] Creating systemd services...${NC}"
-
-    cat > /etc/systemd/system/ssh-ws.service << 'SVCWS'
+    # Main WS service (port from arg)
+    cat > /etc/systemd/system/ssh-ws.service << SVCEOF
 [Unit]
-Description=SSH WebSocket Proxy (Port 80)
+Description=Ragnar SSH-WebSocket Proxy (port ${PORT})
 After=network.target ssh.service
-Wants=ssh.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/local/bin/ssh-ws-proxy.py 80
+ExecStart=/usr/bin/python3 /usr/local/bin/ssh-ws-proxy.py ${PORT}
 Restart=always
 RestartSec=5
 User=root
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-SVCWS
+SVCEOF
 
-    cat > /etc/systemd/system/ssh-wss.service << 'SVCWSS'
+    # Secondary WS service on 8880 (fallback)
+    cat > /etc/systemd/system/ssh-wss.service << 'SVCEOF2'
 [Unit]
-Description=SSH WebSocket Proxy (Port 8443 for WSS)
+Description=Ragnar SSH-WebSocket Proxy fallback (port 8880)
 After=network.target ssh.service
-Wants=ssh.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/local/bin/ssh-ws-proxy.py 8443
+ExecStart=/usr/bin/python3 /usr/local/bin/ssh-ws-proxy.py 8880
 Restart=always
 RestartSec=5
 User=root
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-SVCWSS
+SVCEOF2
 
-    echo -e "${YELLOW}  [4/4] Starting WebSocket services...${NC}"
     systemctl daemon-reload
     systemctl enable ssh-ws ssh-wss >> "$LOG_FILE" 2>&1
     systemctl restart ssh-ws ssh-wss >> "$LOG_FILE" 2>&1
-
-    IP=$(get_public_ip)
-    echo -e "\n  ${GREEN}[✓] SSH WebSocket setup complete!${NC}"
-    echo -e "\n  ${WHITE}NPV Tunnel / HTTP Injector Settings:"
-    echo -e "  ┌─────────────────────────────────────────┐"
-    echo -e "  │  SSH Host   : ${IP}"
-    echo -e "  │  SSH Port   : 22"
-    echo -e "  │  WS Port    : 80    (ws://${IP}:80)"
-    echo -e "  │  WSS Port   : 8443  (wss://${IP}:8443)"
-    echo -e "  │  Proxy Type : WebSocket"
-    echo -e "  └─────────────────────────────────────────┘${NC}"
-
-    log "SSH WebSocket setup completed"
-    read -rp "  Press Enter to continue..."
-    main_menu
 }
 
-setup_stunnel() {
+setup_websocket_full() {
     banner
-    echo -e "${CYAN}  [*] SSH-TLS Setup (Stunnel)${NC}\n"
-    echo -e "${WHITE}  Stunnel wraps SSH inside TLS on port 443"
-    echo -e "  This bypasses deep packet inspection (DPI)${NC}\n"
-
-    echo -e "${YELLOW}  [1/4] Installing stunnel4...${NC}"
-    $PKG_MANAGER install -y stunnel4 >> "$LOG_FILE" 2>&1
-
-    echo -e "${YELLOW}  [2/4] Generating TLS certificate...${NC}"
-    mkdir -p /etc/stunnel
-
-    openssl req -new -x509 -days 3650 -nodes \
-        -out /etc/stunnel/stunnel.pem \
-        -keyout /etc/stunnel/stunnel.pem \
-        -subj "/C=US/ST=State/L=City/O=SSH-VPN/CN=$(get_public_ip)" \
-        >> "$LOG_FILE" 2>&1
-
-    chmod 600 /etc/stunnel/stunnel.pem
-
-    echo -e "${YELLOW}  [3/4] Configuring stunnel...${NC}"
-
-    cat > /etc/stunnel/stunnel.conf << 'STUNNELCONF'
-; Stunnel SSH-TLS Configuration
-; Listens on 443 (TLS), forwards to local SSH port 22
-
-pid = /var/run/stunnel4/stunnel4.pid
-output = /var/log/stunnel4/stunnel.log
-socket = l:TCP_NODELAY=1
-socket = r:TCP_NODELAY=1
-
-[ssh-tls]
-accept  = 443
-connect = 127.0.0.1:22
-cert    = /etc/stunnel/stunnel.pem
-TIMEOUTclose = 0
-STUNNELCONF
-
-    echo -e "${YELLOW}  [4/4] Starting stunnel service...${NC}"
-    systemctl enable stunnel4 >> "$LOG_FILE" 2>&1
-    systemctl restart stunnel4 >> "$LOG_FILE" 2>&1
-
-    IP=$(get_public_ip)
-    echo -e "\n  ${GREEN}[✓] SSH-TLS (Stunnel) setup complete!${NC}"
-    echo -e "\n  ${WHITE}NPV Tunnel / SSH-TLS Settings:"
-    echo -e "  ┌─────────────────────────────────────────┐"
-    echo -e "  │  SSH Host    : ${IP}"
-    echo -e "  │  SSH Port    : 22"
-    echo -e "  │  TLS Host    : ${IP}"
-    echo -e "  │  TLS Port    : 443"
-    echo -e "  │  TLS Mode    : Enabled (Self-signed cert)"
-    echo -e "  │  Protocol    : SSH over TLS"
-    echo -e "  └─────────────────────────────────────────┘${NC}"
-
-    log "SSH-TLS stunnel setup completed"
-    read -rp "  Press Enter to continue..."
-    main_menu
-}
-
-user_management_menu() {
-    banner
-    echo -e "${WHITE}  ┌──────────────────────────────────────┐${NC}"
-    echo -e "${WHITE}  │        USER MANAGEMENT               │${NC}"
-    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[1]${WHITE} Create User                      │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[2]${WHITE} Delete User                      │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[3]${WHITE} Extend User Expiry               │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[4]${WHITE} Lock / Unlock User               │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[5]${WHITE} List All Users                   │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[6]${WHITE} Check User Details               │${NC}"
-    echo -e "${WHITE}  │ ${RED}[0]${WHITE} Back to Main Menu                │${NC}"
-    echo -e "${WHITE}  └──────────────────────────────────────┘${NC}"
-    echo -ne "\n  ${YELLOW}Select option: ${NC}"
-    read -r OPTION
-
-    case $OPTION in
-        1) create_user ;;
-        2) delete_user ;;
-        3) extend_user ;;
-        4) lock_unlock_user ;;
-        5) list_users ;;
-        6) check_user ;;
-        0) main_menu ;;
-        *) echo -e "${RED}Invalid option.${NC}"; sleep 1; user_management_menu ;;
-    esac
-}
-
-create_user() {
-    banner
-    echo -e "${CYAN}  [*] Create SSH VPN User${NC}\n"
-
-    echo -ne "  ${YELLOW}Username: ${NC}"
-    read -r USERNAME
-
-    if [[ -z "$USERNAME" ]]; then
-        echo -e "  ${RED}Username cannot be empty.${NC}"
-        sleep 1; user_management_menu; return
-    fi
-
-    if id "$USERNAME" &>/dev/null; then
-        echo -e "  ${RED}User '${USERNAME}' already exists.${NC}"
-        sleep 2; user_management_menu; return
-    fi
-
-    echo -ne "  ${YELLOW}Password: ${NC}"
-    read -rs PASSWORD
-    echo
-
-    echo -ne "  ${YELLOW}Expiry days (e.g. 30): ${NC}"
-    read -r DAYS
-    DAYS=${DAYS:-30}
-
-    echo -ne "  ${YELLOW}Max logins (e.g. 2): ${NC}"
-    read -r MAX_LOGINS
-    MAX_LOGINS=${MAX_LOGINS:-2}
-
-    echo -ne "  ${YELLOW}Allow full SSH login? (y/N) [N=VPN-only]: ${NC}"
-    read -r FULL_LOGIN
-    if [[ "${FULL_LOGIN,,}" == "y" ]]; then
-        USER_SHELL="/bin/bash"
-        LOGIN_TYPE="Full SSH"
-    else
-        USER_SHELL="/bin/false"
-        LOGIN_TYPE="VPN-only (no shell)"
-    fi
-
-    EXPIRY_DATE=$(date -d "+${DAYS} days" '+%Y-%m-%d')
-
-    useradd -m -s "$USER_SHELL" -e "$EXPIRY_DATE" "$USERNAME" >> "$LOG_FILE" 2>&1
-    echo "$USERNAME:$PASSWORD" | chpasswd >> "$LOG_FILE" 2>&1
-
-    echo "${USERNAME}:${PASSWORD}:${EXPIRY_DATE}:${MAX_LOGINS}:$(date '+%Y-%m-%d')" >> "$USER_DB"
-
-    IP=$(get_public_ip)
-    echo -e "\n  ${GREEN}[✓] User created successfully!${NC}"
-    echo -e "\n  ${WHITE}Account Details:"
-    echo -e "  ┌─────────────────────────────────────────┐"
-    echo -e "  │  Username   : ${USERNAME}"
-    echo -e "  │  Password   : ${PASSWORD}"
-    echo -e "  │  Expires    : ${EXPIRY_DATE} (${DAYS} days)"
-    echo -e "  │  Max Logins : ${MAX_LOGINS}"
-    echo -e "  │  Login Type : ${LOGIN_TYPE}"
-    echo -e "  │  SSH Host   : ${IP}"
-    echo -e "  │  SSH Port   : 22 / 80"
-    echo -e "  │  WS Port    : 80"
-    echo -e "  │  TLS Port   : 443"
-    echo -e "  └─────────────────────────────────────────┘${NC}"
-
-    log "User created: $USERNAME (expires: $EXPIRY_DATE)"
-    read -rp "  Press Enter to continue..."
-    user_management_menu
-}
-
-delete_user() {
-    banner
-    echo -e "${CYAN}  [*] Delete SSH VPN User${NC}\n"
-    echo -ne "  ${YELLOW}Username to delete: ${NC}"
-    read -r USERNAME
-
-    if ! id "$USERNAME" &>/dev/null; then
-        echo -e "  ${RED}User '${USERNAME}' does not exist.${NC}"
-        sleep 2; user_management_menu; return
-    fi
-
-    echo -ne "  ${YELLOW}Are you sure? (y/N): ${NC}"
-    read -r CONFIRM
-    if [[ "${CONFIRM,,}" != "y" ]]; then
-        echo -e "  ${YELLOW}Cancelled.${NC}"
-        sleep 1; user_management_menu; return
-    fi
-
-    pkill -u "$USERNAME" >> "$LOG_FILE" 2>&1
-    userdel -f "$USERNAME" >> "$LOG_FILE" 2>&1
-
-    sed -i "/^${USERNAME}:/d" "$USER_DB"
-
-    echo -e "  ${GREEN}[✓] User '${USERNAME}' deleted.${NC}"
-    log "User deleted: $USERNAME"
-    read -rp "  Press Enter to continue..."
-    user_management_menu
-}
-
-extend_user() {
-    banner
-    echo -e "${CYAN}  [*] Extend User Expiry${NC}\n"
-    echo -ne "  ${YELLOW}Username: ${NC}"
-    read -r USERNAME
-
-    if ! id "$USERNAME" &>/dev/null; then
-        echo -e "  ${RED}User not found.${NC}"
-        sleep 2; user_management_menu; return
-    fi
-
-    echo -ne "  ${YELLOW}Extend by days: ${NC}"
-    read -r DAYS
-    DAYS=${DAYS:-30}
-
-    CURRENT_EXPIRY=$(chage -l "$USERNAME" | grep "Account expires" | awk -F': ' '{print $2}')
-    if [[ "$CURRENT_EXPIRY" == "never" || -z "$CURRENT_EXPIRY" ]]; then
-        NEW_EXPIRY=$(date -d "+${DAYS} days" '+%Y-%m-%d')
-    else
-        NEW_EXPIRY=$(date -d "$CURRENT_EXPIRY +${DAYS} days" '+%Y-%m-%d' 2>/dev/null || date -d "+${DAYS} days" '+%Y-%m-%d')
-    fi
-
-    chage -E "$NEW_EXPIRY" "$USERNAME"
-    sed -i "s/^${USERNAME}:\([^:]*\):[^:]*:/\1:${NEW_EXPIRY}:/" "$USER_DB"
-
-    echo -e "  ${GREEN}[✓] User '${USERNAME}' extended until ${NEW_EXPIRY}.${NC}"
-    log "User extended: $USERNAME until $NEW_EXPIRY"
-    read -rp "  Press Enter to continue..."
-    user_management_menu
-}
-
-lock_unlock_user() {
-    banner
-    echo -e "${CYAN}  [*] Lock / Unlock User${NC}\n"
-    echo -ne "  ${YELLOW}Username: ${NC}"
-    read -r USERNAME
-
-    if ! id "$USERNAME" &>/dev/null; then
-        echo -e "  ${RED}User not found.${NC}"
-        sleep 2; user_management_menu; return
-    fi
-
-    STATUS=$(passwd -S "$USERNAME" | awk '{print $2}')
-    if [[ "$STATUS" == "L" || "$STATUS" == "LK" ]]; then
-        passwd -u "$USERNAME" >> "$LOG_FILE" 2>&1
-        echo -e "  ${GREEN}[✓] User '${USERNAME}' unlocked.${NC}"
-        log "User unlocked: $USERNAME"
-    else
-        passwd -l "$USERNAME" >> "$LOG_FILE" 2>&1
-        pkill -u "$USERNAME" >> "$LOG_FILE" 2>&1
-        echo -e "  ${YELLOW}[✓] User '${USERNAME}' locked and disconnected.${NC}"
-        log "User locked: $USERNAME"
-    fi
-
-    read -rp "  Press Enter to continue..."
-    user_management_menu
-}
-
-list_users() {
-    banner
-    echo -e "${CYAN}  [*] All SSH VPN Users${NC}\n"
-    echo -e "  ${WHITE}%-15s %-20s %-12s %-10s${NC}" "Username" "Expires" "Status" "Online"
-    echo -e "  ${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-    while IFS=: read -r USER PASS EXPIRY MAXLOGINS CREATED; do
-        [[ -z "$USER" ]] && continue
-
-        STATUS=$(passwd -S "$USER" 2>/dev/null | awk '{print $2}')
-        [[ "$STATUS" == "L" || "$STATUS" == "LK" ]] && STATUS_TEXT="${RED}Locked${NC}" || STATUS_TEXT="${GREEN}Active${NC}"
-
-        ONLINE=$(who | grep -c "^${USER} " 2>/dev/null || echo "0")
-        [[ "$ONLINE" -gt 0 ]] && ONLINE_TEXT="${GREEN}${ONLINE}${NC}" || ONLINE_TEXT="${YELLOW}0${NC}"
-
-        printf "  %-15s %-20s " "$USER" "$EXPIRY"
-        echo -e "$STATUS_TEXT  $ONLINE_TEXT"
-    done < "$USER_DB"
-
-    echo -e "\n  ${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "  Total users: $(wc -l < "$USER_DB")"
-    read -rp "  Press Enter to continue..."
-    user_management_menu
-}
-
-check_user() {
-    banner
-    echo -e "${CYAN}  [*] Check User Details${NC}\n"
-    echo -ne "  ${YELLOW}Username: ${NC}"
-    read -r USERNAME
-
-    if ! id "$USERNAME" &>/dev/null; then
-        echo -e "  ${RED}User not found.${NC}"
-        sleep 2; user_management_menu; return
-    fi
-
-    USER_LINE=$(grep "^${USERNAME}:" "$USER_DB" 2>/dev/null)
-    EXPIRY=$(echo "$USER_LINE" | cut -d: -f3)
-    MAX_LOGIN=$(echo "$USER_LINE" | cut -d: -f4)
-    CREATED=$(echo "$USER_LINE" | cut -d: -f5)
-
-    ONLINE=$(who | grep -c "^${USERNAME} " 2>/dev/null || echo "0")
-    STATUS=$(passwd -S "$USERNAME" 2>/dev/null | awk '{print $2}')
-    [[ "$STATUS" == "L" || "$STATUS" == "LK" ]] && STATUS_TEXT="Locked" || STATUS_TEXT="Active"
-
-    DAYS_LEFT=$(( ( $(date -d "$EXPIRY" +%s) - $(date +%s) ) / 86400 )) 2>/dev/null || DAYS_LEFT="N/A"
-
-    echo -e "  ${WHITE}┌─────────────────────────────────────────┐"
-    echo -e "  │  Username     : ${USERNAME}"
-    echo -e "  │  Status       : ${STATUS_TEXT}"
-    echo -e "  │  Created      : ${CREATED:-N/A}"
-    echo -e "  │  Expires      : ${EXPIRY:-N/A}"
-    echo -e "  │  Days Left    : ${DAYS_LEFT}"
-    echo -e "  │  Max Logins   : ${MAX_LOGIN:-N/A}"
-    echo -e "  │  Online Now   : ${ONLINE} session(s)"
-    echo -e "  └─────────────────────────────────────────┘${NC}"
-
-    read -rp "  Press Enter to continue..."
-    user_management_menu
-}
-
-port_management_menu() {
-    banner
-    echo -e "${WHITE}  ┌──────────────────────────────────────┐${NC}"
-    echo -e "${WHITE}  │        PORT MANAGEMENT               │${NC}"
-    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[1]${WHITE} Add SSH Port                     │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[2]${WHITE} Remove SSH Port                  │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[3]${WHITE} Change WS Port                   │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[4]${WHITE} Open Firewall Port               │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[5]${WHITE} List Open Ports                  │${NC}"
-    echo -e "${WHITE}  │ ${RED}[0]${WHITE} Back to Main Menu                │${NC}"
-    echo -e "${WHITE}  └──────────────────────────────────────┘${NC}"
-    echo -ne "\n  ${YELLOW}Select option: ${NC}"
-    read -r OPTION
-
-    case $OPTION in
-        1) add_ssh_port ;;
-        2) remove_ssh_port ;;
-        3) change_ws_port ;;
-        4) open_firewall_port ;;
-        5) list_open_ports ;;
-        0) main_menu ;;
-        *) echo -e "${RED}Invalid option.${NC}"; sleep 1; port_management_menu ;;
-    esac
-}
-
-add_ssh_port() {
-    banner
-    echo -ne "  ${YELLOW}Enter port to add for SSH: ${NC}"
-    read -r PORT
-
-    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-        echo -e "  ${RED}Invalid port number.${NC}"; sleep 2; port_management_menu; return
-    fi
-
-    if grep -q "^Port $PORT" /etc/ssh/sshd_config; then
-        echo -e "  ${YELLOW}Port $PORT already exists in SSH config.${NC}"
-        sleep 2; port_management_menu; return
-    fi
-
-    echo "Port $PORT" >> /etc/ssh/sshd_config
-    systemctl restart ssh >> "$LOG_FILE" 2>&1
-
-    iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null
-
-    echo -e "  ${GREEN}[✓] SSH port ${PORT} added.${NC}"
-    log "Added SSH port: $PORT"
-    read -rp "  Press Enter to continue..."
-    port_management_menu
-}
-
-remove_ssh_port() {
-    banner
-    echo -ne "  ${YELLOW}Enter port to remove from SSH: ${NC}"
-    read -r PORT
-
-    sed -i "/^Port $PORT$/d" /etc/ssh/sshd_config
-    systemctl restart ssh >> "$LOG_FILE" 2>&1
-
-    echo -e "  ${GREEN}[✓] SSH port ${PORT} removed.${NC}"
-    log "Removed SSH port: $PORT"
-    read -rp "  Press Enter to continue..."
-    port_management_menu
+    echo -e "${CYAN}  [*] Installing SSH-WebSocket Proxy...${NC}\n"
+    echo -ne "  ${YELLOW}WS Port [80]: ${NC}"; read -r WS_PORT
+    WS_PORT=${WS_PORT:-80}
+    deploy_ws_proxy "$WS_PORT"
+    local IP; IP=$(get_public_ip)
+    echo -e "\n  ${GREEN}[✓] WebSocket proxy deployed on port ${WS_PORT}!${NC}"
+    echo -e "  WS URL  : ws://${IP}:${WS_PORT}"
+    echo -e "  WSS URL : ws://${IP}:8880 (fallback)"
+    log "WS proxy installed on port $WS_PORT"
+    read -rp "  Press Enter..."; ws_menu
 }
 
 change_ws_port() {
     banner
-    echo -ne "  ${YELLOW}New WebSocket port: ${NC}"
-    read -r PORT
-
-    if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
-        echo -e "  ${RED}Invalid port.${NC}"; sleep 2; port_management_menu; return
-    fi
-
-    sed -i "s|ExecStart=.*ssh-ws-proxy.py .*|ExecStart=/usr/bin/python3 /usr/local/bin/ssh-ws-proxy.py $PORT|" \
-        /etc/systemd/system/ssh-ws.service
-
-    systemctl daemon-reload
-    systemctl restart ssh-ws >> "$LOG_FILE" 2>&1
-
-    echo -e "  ${GREEN}[✓] WebSocket port changed to ${PORT}.${NC}"
-    log "Changed WS port to: $PORT"
-    read -rp "  Press Enter to continue..."
-    port_management_menu
+    echo -ne "  ${YELLOW}New WS port: ${NC}"; read -r NEW_PORT
+    [[ ! "$NEW_PORT" =~ ^[0-9]+$ ]] && { echo -e "${RED}Invalid.${NC}"; sleep 1; ws_menu; return; }
+    deploy_ws_proxy "$NEW_PORT"
+    echo -e "  ${GREEN}[✓] WS port changed to ${NEW_PORT}.${NC}"
+    log "WS port changed to $NEW_PORT"
+    read -rp "  Press Enter..."; ws_menu
 }
 
-open_firewall_port() {
+# ── [3] Stunnel TLS ──────────────────────────────────────────────
+
+deploy_stunnel_silent() {
+    detect_os
+    $PKG_MANAGER install -y stunnel4 openssl >> "$LOG_FILE" 2>&1
+    mkdir -p /etc/stunnel /var/run/stunnel4 /var/log/stunnel4
+    local IP; IP=$(get_public_ip)
+    openssl req -new -x509 -days 3650 -nodes \
+        -out /etc/stunnel/stunnel.pem -keyout /etc/stunnel/stunnel.pem \
+        -subj "/C=US/O=RagnarVPN/CN=${IP}" >> "$LOG_FILE" 2>&1
+    chmod 600 /etc/stunnel/stunnel.pem
+
+    cat > /etc/stunnel/stunnel.conf << 'STLCONF'
+pid     = /var/run/stunnel4/stunnel4.pid
+output  = /var/log/stunnel4/stunnel.log
+socket  = l:TCP_NODELAY=1
+socket  = r:TCP_NODELAY=1
+
+[npv-tls]
+accept  = 443
+connect = 127.0.0.1:22
+cert    = /etc/stunnel/stunnel.pem
+TIMEOUTclose = 0
+STLCONF
+
+    systemctl enable stunnel4 >> "$LOG_FILE" 2>&1
+    systemctl restart stunnel4 >> "$LOG_FILE" 2>&1
+}
+
+setup_stunnel() {
     banner
-    echo -ne "  ${YELLOW}Port to open in firewall: ${NC}"
-    read -r PORT
-    echo -ne "  ${YELLOW}Protocol (tcp/udp) [tcp]: ${NC}"
-    read -r PROTO
-    PROTO=${PROTO:-tcp}
-
-    if command -v ufw &>/dev/null; then
-        ufw allow "$PORT/$PROTO" >> "$LOG_FILE" 2>&1
-        echo -e "  ${GREEN}[✓] UFW: Port ${PORT}/${PROTO} opened.${NC}"
-    fi
-
-    iptables -I INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null
-    echo -e "  ${GREEN}[✓] iptables: Port ${PORT}/${PROTO} opened.${NC}"
-    log "Opened firewall port: $PORT/$PROTO"
-    read -rp "  Press Enter to continue..."
-    port_management_menu
+    echo -e "${CYAN}  [*] SSH-TLS Setup (Stunnel port 443)...${NC}\n"
+    deploy_stunnel_silent
+    local IP; IP=$(get_public_ip)
+    echo -e "  ${GREEN}[✓] Stunnel running on port 443!${NC}"
+    echo -e "\n  ${WHITE}NPV Tunnel TLS Settings:"
+    echo -e "  ┌─────────────────────────────────────────┐"
+    echo -e "  │  TLS Host : ${IP}"
+    echo -e "  │  TLS Port : 443"
+    echo -e "  │  SSH Port : 22 (via TLS)"
+    echo -e "  │  TLS Cert : Self-signed (skip verify)"
+    echo -e "  └─────────────────────────────────────────┘${NC}"
+    log "Stunnel TLS setup"
+    read -rp "  Press Enter..."; main_menu
 }
 
-list_open_ports() {
-    banner
-    echo -e "${CYAN}  [*] Currently Open/Listening Ports${NC}\n"
-    ss -tlnp 2>/dev/null | grep LISTEN | awk '{print $4, $6}' | \
-        sed 's/.*://' | column -t | \
-        while read -r PORT PROC; do
-            echo -e "  ${GREEN}[OPEN]${NC} Port ${WHITE}${PORT}${NC} — ${PROC}"
-        done
-    echo ""
-    read -rp "  Press Enter to continue..."
-    port_management_menu
-}
-
-monitor_connections() {
-    banner
-    echo -e "${CYAN}  [*] Live Connection Monitor (Ctrl+C to stop)${NC}\n"
-
-    while true; do
-        clear
-        banner
-        echo -e "${CYAN}  [*] Active SSH Connections — $(date '+%H:%M:%S')${NC}\n"
-
-        TOTAL=0
-        echo -e "  ${WHITE}%-15s %-20s %-15s${NC}" "User" "From IP" "Duration"
-        echo -e "  ${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-        while IFS= read -r line; do
-            USER=$(echo "$line" | awk '{print $1}')
-            IP=$(echo "$line" | awk '{print $3}' | sed 's/[()]//g')
-            TIME=$(echo "$line" | awk '{print $4, $5}')
-            printf "  %-15s %-20s %-15s\n" "$USER" "$IP" "$TIME"
-            ((TOTAL++))
-        done < <(who 2>/dev/null)
-
-        echo -e "  ${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "  Total connections: ${GREEN}${TOTAL}${NC}"
-        echo -e "\n  ${YELLOW}Refreshing every 5s — Ctrl+C to exit...${NC}"
-        sleep 5
-    done
-}
-
-show_connection_details() {
-    banner
-    IP=$(get_public_ip)
-    echo -e "${CYAN}  [*] Server Connection Details${NC}\n"
-    echo -e "  ${WHITE}┌──────────────────────────────────────────────────┐"
-    echo -e "  │            SSH / VPN CONNECTION INFO                │"
-    echo -e "  ├──────────────────────────────────────────────────┤"
-    echo -e "  │  Public IP      : ${IP}"
-    echo -e "  │"
-    echo -e "  │  [SSH DIRECT]"
-    echo -e "  │  Host           : ${IP}"
-    echo -e "  │  Ports          : 22, 80, 443"
-    echo -e "  │"
-    echo -e "  │  [SSH WEBSOCKET (NPV Tunnel / HTTP Injector)]"
-    echo -e "  │  SSH Host       : ${IP}"
-    echo -e "  │  SSH Port       : 22"
-    echo -e "  │  WS URL         : ws://${IP}:80"
-    echo -e "  │  WSS URL        : wss://${IP}:8443"
-    echo -e "  │  Payload        : GET / HTTP/1.1[crlf]Host: ${IP}[crlf][crlf]"
-    echo -e "  │"
-    echo -e "  │  [SSH TLS (Stunnel)]"
-    echo -e "  │  SSH Host       : 127.0.0.1 (via stunnel)"
-    echo -e "  │  SSH Port       : 22"
-    echo -e "  │  TLS Host       : ${IP}"
-    echo -e "  │  TLS Port       : 443"
-    echo -e "  │  TLS Verify     : No (self-signed)"
-    echo -e "  └──────────────────────────────────────────────────┘${NC}"
-
-    echo -e "\n  ${YELLOW}Services Status:${NC}"
-    for SVC in ssh ssh-ws ssh-wss stunnel4; do
-        if systemctl is-active --quiet "$SVC" 2>/dev/null; then
-            echo -e "  ${GREEN}[✓] ${SVC} — Running${NC}"
-        else
-            echo -e "  ${RED}[✗] ${SVC} — Not running${NC}"
-        fi
-    done
-
-    read -rp "  Press Enter to continue..."
-    main_menu
-}
-
-system_info() {
-    banner
-    echo -e "${CYAN}  [*] System Information${NC}\n"
-
-    OS_INFO=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
-    UPTIME=$(uptime -p 2>/dev/null || uptime)
-    CPU_USAGE=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d% -f1 2>/dev/null || echo "N/A")
-    MEM_TOTAL=$(free -m | awk 'NR==2{print $2}')
-    MEM_USED=$(free -m | awk 'NR==2{print $3}')
-    DISK_USAGE=$(df -h / | awk 'NR==2{print $3"/"$2" ("$5")"}')
-
-    echo -e "  ${WHITE}┌──────────────────────────────────────────┐"
-    echo -e "  │  OS          : ${OS_INFO}"
-    echo -e "  │  Uptime      : ${UPTIME}"
-    echo -e "  │  CPU Usage   : ${CPU_USAGE}%"
-    echo -e "  │  Memory      : ${MEM_USED} MB / ${MEM_TOTAL} MB"
-    echo -e "  │  Disk        : ${DISK_USAGE}"
-    echo -e "  │  Kernel      : $(uname -r)"
-    echo -e "  │  Total Users : $(wc -l < "$USER_DB")"
-    echo -e "  └──────────────────────────────────────────┘${NC}"
-
-    read -rp "  Press Enter to continue..."
-    main_menu
-}
+# ── [4] Cloudflare ───────────────────────────────────────────────
 
 cloudflare_menu() {
     banner
-    CF_STATUS="Not running"
-    CF_DOMAIN_DISPLAY="None"
-    if systemctl is-active --quiet cloudflared-tunnel 2>/dev/null; then
-        CF_STATUS="${GREEN}Running${NC}"
-        CF_DOMAIN_DISPLAY="${CYAN}$(cat "$CF_DOMAIN_FILE" 2>/dev/null || echo 'Unknown')${NC}"
-    else
-        CF_STATUS="${RED}Stopped${NC}"
-    fi
-
+    local CF_S; CF_S="$(svc_status cloudflared-tunnel) $(systemctl is-active cloudflared-tunnel 2>/dev/null)"
+    local CF_DOM; CF_DOM=$(cat "$CF_DOMAIN_FILE" 2>/dev/null || echo "None")
     echo -e "${WHITE}  ┌──────────────────────────────────────┐${NC}"
     echo -e "${WHITE}  │      CLOUDFLARE FREE DOMAIN          │${NC}"
     echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
-    echo -e "  │  Status : $(echo -e $CF_STATUS)"
-    echo -e "  │  Domain : $(echo -e $CF_DOMAIN_DISPLAY)"
+    echo -e "  │  Status : ${CF_S}"
+    echo -e "  │  Domain : ${CYAN}${CF_DOM}${NC}"
     echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[1]${WHITE} Install & Start Cloudflare Tunnel │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[2]${WHITE} Show Current Domain               │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[3]${WHITE} Restart Tunnel (get new domain)   │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[1]${WHITE} Install & Start Tunnel            │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[2]${WHITE} Show Domain / NPV Config          │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[3]${WHITE} Restart (get new domain)          │${NC}"
     echo -e "${WHITE}  │ ${RED}[4]${WHITE} Stop Tunnel                      │${NC}"
     echo -e "${WHITE}  │ ${RED}[5]${WHITE} Uninstall cloudflared            │${NC}"
-    echo -e "${WHITE}  │ ${YELLOW}[0]${WHITE} Back to Main Menu                │${NC}"
+    echo -e "${WHITE}  │ ${RED}[0]${WHITE} Back                             │${NC}"
     echo -e "${WHITE}  └──────────────────────────────────────┘${NC}"
-    echo -ne "\n  ${YELLOW}Select option: ${NC}"
-    read -r OPTION
-
-    case $OPTION in
+    echo -ne "\n  ${YELLOW}Select: ${NC}"; read -r OPT
+    case $OPT in
         1) install_cloudflare ;;
         2) show_cf_domain ;;
         3) restart_cf_tunnel ;;
-        4) stop_cf_tunnel ;;
+        4) systemctl stop cloudflared-tunnel; systemctl disable cloudflared-tunnel; echo -e "  ${YELLOW}Stopped.${NC}"; sleep 1; cloudflare_menu ;;
         5) uninstall_cloudflare ;;
         0) main_menu ;;
-        *) echo -e "${RED}Invalid option.${NC}"; sleep 1; cloudflare_menu ;;
+        *) cloudflare_menu ;;
     esac
 }
 
 install_cloudflare() {
     banner
-    echo -e "${CYAN}  [*] Setting up Cloudflare Free Domain...${NC}\n"
-    echo -e "${WHITE}  This installs cloudflared and creates a FREE tunnel."
-    echo -e "  You get a public domain like: abc123.trycloudflare.com"
-    echo -e "  No Cloudflare account required!${NC}\n"
+    echo -e "${CYAN}  [*] Setting up Cloudflare Free Tunnel...${NC}\n"
 
-    detect_os
-
-    if command -v cloudflared &>/dev/null; then
-        echo -e "  ${YELLOW}cloudflared already installed. Starting tunnel...${NC}"
-    else
-        echo -e "${YELLOW}  [1/3] Downloading cloudflared...${NC}"
-        ARCH=$(uname -m)
+    if ! command -v cloudflared &>/dev/null; then
+        echo -e "${YELLOW}  Downloading cloudflared...${NC}"
+        local ARCH; ARCH=$(uname -m)
         case "$ARCH" in
             x86_64)  CF_ARCH="amd64" ;;
             aarch64) CF_ARCH="arm64" ;;
-            armv7l)  CF_ARCH="arm" ;;
+            armv7l)  CF_ARCH="arm"   ;;
             *)       CF_ARCH="amd64" ;;
         esac
-
-        CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
-        curl -sSL "$CF_URL" -o /usr/local/bin/cloudflared >> "$LOG_FILE" 2>&1
+        curl -sSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" \
+            -o /usr/local/bin/cloudflared >> "$LOG_FILE" 2>&1
         chmod +x /usr/local/bin/cloudflared
-
-        if ! command -v cloudflared &>/dev/null; then
-            echo -e "  ${RED}[✗] Failed to install cloudflared. Check your internet connection.${NC}"
-            read -rp "  Press Enter to continue..."
-            cloudflare_menu; return
-        fi
+        command -v cloudflared &>/dev/null || { echo -e "${RED}Install failed.${NC}"; read -rp "Enter..."; cloudflare_menu; return; }
         echo -e "  ${GREEN}[✓] cloudflared installed.${NC}"
+    else
+        echo -e "  ${GREEN}[✓] cloudflared already present.${NC}"
     fi
 
-    echo -e "${YELLOW}  [2/3] Creating systemd tunnel service...${NC}"
-
-    cat > /etc/systemd/system/cloudflared-tunnel.service << 'CFSVC'
+    local WS_P; WS_P=$(get_ws_port)
+    cat > /etc/systemd/system/cloudflared-tunnel.service << CFSVC
 [Unit]
-Description=Cloudflare Quick Tunnel (SSH-WS)
+Description=Cloudflare Quick Tunnel → SSH-WS port ${WS_P}
 After=network.target ssh-ws.service
-Wants=ssh-ws.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:80 --no-autoupdate
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:${WS_P} --no-autoupdate
 Restart=always
 RestartSec=10
 User=root
@@ -940,251 +521,592 @@ CFSVC
     systemctl enable cloudflared-tunnel >> "$LOG_FILE" 2>&1
     systemctl restart cloudflared-tunnel >> "$LOG_FILE" 2>&1
 
-    echo -e "${YELLOW}  [3/3] Waiting for Cloudflare to assign domain...${NC}"
-    CF_DOMAIN=""
-    for i in $(seq 1 20); do
+    echo -e "  ${YELLOW}Waiting for Cloudflare domain (up to 30s)...${NC}"
+    local CF_DOM=""
+    for i in $(seq 1 10); do
         sleep 3
-        CF_DOMAIN=$(journalctl -u cloudflared-tunnel --no-pager -n 50 2>/dev/null | \
+        CF_DOM=$(journalctl -u cloudflared-tunnel --no-pager -n 80 2>/dev/null | \
             grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1)
-        if [[ -n "$CF_DOMAIN" ]]; then
-            break
-        fi
-        echo -ne "  Waiting... (${i}/20)\r"
+        [[ -n "$CF_DOM" ]] && break
+        echo -ne "  Attempt ${i}/10...\r"
     done
 
-    if [[ -z "$CF_DOMAIN" ]]; then
-        echo -e "\n  ${YELLOW}[!] Domain not detected yet. Try option [2] in a moment.${NC}"
-        log "Cloudflare tunnel started but domain not yet detected"
-        read -rp "  Press Enter to continue..."
-        cloudflare_menu; return
+    if [[ -n "$CF_DOM" ]]; then
+        echo "$CF_DOM" > "$CF_DOMAIN_FILE"
+        echo -e "\n  ${GREEN}[✓] Cloudflare tunnel LIVE!${NC}"
+        echo -e "  Domain: ${CYAN}${CF_DOM}${NC}"
+        _print_npv_cf_config "$CF_DOM"
+    else
+        echo -e "\n  ${YELLOW}Domain not detected yet. Use [2] in a moment.${NC}"
     fi
+    log "Cloudflare tunnel started"
+    read -rp "  Press Enter..."; cloudflare_menu
+}
 
-    echo "$CF_DOMAIN" > "$CF_DOMAIN_FILE"
-
-    echo -e "\n  ${GREEN}[✓] Cloudflare tunnel is LIVE!${NC}"
+_print_npv_cf_config() {
+    local DOM="$1"
+    local IP; IP=$(get_public_ip)
     echo -e "\n  ${WHITE}┌──────────────────────────────────────────────────────┐"
-    echo -e "  │         YOUR FREE CLOUDFLARE DOMAIN                  │"
+    echo -e "  │  NPV Tunnel Settings via Cloudflare:                 │"
     echo -e "  ├──────────────────────────────────────────────────────┤"
-    echo -e "  │  Domain  : ${CYAN}${CF_DOMAIN}${WHITE}"
-    echo -e "  │  WS URL  : ${CYAN}${CF_DOMAIN}${WHITE}  (port 80 tunneled)"
-    echo -e "  │"
-    echo -e "  │  NPV Tunnel / HTTP Injector Settings:"
-    echo -e "  │  ► SSH Host  : $(get_public_ip)"
-    echo -e "  │  ► SSH Port  : 22"
-    echo -e "  │  ► Proxy     : ${CF_DOMAIN}"
-    echo -e "  │  ► Proxy Port: 443 (Cloudflare HTTPS)"
+    echo -e "  │  SSH Host   : ${IP}"
+    echo -e "  │  SSH Port   : 22"
+    echo -e "  │  Proxy Host : ${DOM}"
+    echo -e "  │  Proxy Port : 443 (Cloudflare HTTPS)"
+    echo -e "  │  Proxy Type : WebSocket over HTTPS"
     echo -e "  └──────────────────────────────────────────────────────┘${NC}"
-
-    log "Cloudflare tunnel started: $CF_DOMAIN"
-    read -rp "  Press Enter to continue..."
-    cloudflare_menu
 }
 
 show_cf_domain() {
     banner
-    echo -e "${CYAN}  [*] Current Cloudflare Domain${NC}\n"
-
-    if ! systemctl is-active --quiet cloudflared-tunnel 2>/dev/null; then
-        echo -e "  ${RED}[✗] Cloudflare tunnel is not running.${NC}"
-        echo -e "  ${YELLOW}Use option [1] to install and start it.${NC}"
-        read -rp "  Press Enter to continue..."
-        cloudflare_menu; return
-    fi
-
-    CF_DOMAIN=$(journalctl -u cloudflared-tunnel --no-pager -n 100 2>/dev/null | \
+    local CF_DOM
+    CF_DOM=$(journalctl -u cloudflared-tunnel --no-pager -n 100 2>/dev/null | \
         grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1)
-
-    if [[ -z "$CF_DOMAIN" ]]; then
-        CF_DOMAIN=$(cat "$CF_DOMAIN_FILE" 2>/dev/null)
+    [[ -z "$CF_DOM" ]] && CF_DOM=$(cat "$CF_DOMAIN_FILE" 2>/dev/null)
+    if [[ -z "$CF_DOM" ]]; then
+        echo -e "  ${RED}No domain found. Is the tunnel running?${NC}"
+        read -rp "  Press Enter..."; cloudflare_menu; return
     fi
-
-    if [[ -z "$CF_DOMAIN" ]]; then
-        echo -e "  ${YELLOW}[!] Domain not detected yet. Wait a few seconds and try again.${NC}"
-        read -rp "  Press Enter to continue..."
-        cloudflare_menu; return
-    fi
-
-    echo "$CF_DOMAIN" > "$CF_DOMAIN_FILE"
-    IP=$(get_public_ip)
-
-    echo -e "  ${WHITE}┌──────────────────────────────────────────────────────┐"
-    echo -e "  │  Free Domain  : ${CYAN}${CF_DOMAIN}${WHITE}"
-    echo -e "  │  Tunnel Port  : 443 (Cloudflare HTTPS → port 80)"
-    echo -e "  │  SSH Host     : ${IP}"
-    echo -e "  │  SSH Port     : 22"
-    echo -e "  │"
-    echo -e "  │  For NPV Tunnel / HTTP Injector:"
-    echo -e "  │  Host   → ${CF_DOMAIN}"
-    echo -e "  │  Port   → 443"
-    echo -e "  └──────────────────────────────────────────────────────┘${NC}"
-
-    read -rp "  Press Enter to continue..."
-    cloudflare_menu
+    echo "$CF_DOM" > "$CF_DOMAIN_FILE"
+    _print_npv_cf_config "$CF_DOM"
+    read -rp "  Press Enter..."; cloudflare_menu
 }
 
 restart_cf_tunnel() {
     banner
-    echo -e "${CYAN}  [*] Restarting Cloudflare Tunnel...${NC}\n"
-    echo -e "${YELLOW}  A new random domain will be assigned.${NC}\n"
-
-    systemctl restart cloudflared-tunnel >> "$LOG_FILE" 2>&1
-
-    echo -e "  ${YELLOW}Waiting for new domain...${NC}"
-    CF_DOMAIN=""
-    for i in $(seq 1 20); do
-        sleep 3
-        CF_DOMAIN=$(journalctl -u cloudflared-tunnel --no-pager -n 50 2>/dev/null | \
-            grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1)
-        [[ -n "$CF_DOMAIN" ]] && break
-        echo -ne "  Waiting... (${i}/20)\r"
-    done
-
-    if [[ -n "$CF_DOMAIN" ]]; then
-        echo "$CF_DOMAIN" > "$CF_DOMAIN_FILE"
-        echo -e "\n  ${GREEN}[✓] New Cloudflare domain: ${CYAN}${CF_DOMAIN}${NC}"
-        log "Cloudflare tunnel restarted: $CF_DOMAIN"
-    else
-        echo -e "\n  ${YELLOW}[!] Domain not detected yet. Try option [2] in a moment.${NC}"
-    fi
-
-    read -rp "  Press Enter to continue..."
-    cloudflare_menu
-}
-
-stop_cf_tunnel() {
-    banner
-    echo -e "${CYAN}  [*] Stopping Cloudflare Tunnel...${NC}\n"
-    systemctl stop cloudflared-tunnel >> "$LOG_FILE" 2>&1
-    systemctl disable cloudflared-tunnel >> "$LOG_FILE" 2>&1
-    echo -e "  ${YELLOW}[✓] Cloudflare tunnel stopped.${NC}"
-    log "Cloudflare tunnel stopped"
-    read -rp "  Press Enter to continue..."
-    cloudflare_menu
+    echo -e "${YELLOW}  Restarting Cloudflare tunnel...${NC}"
+    systemctl restart cloudflared-tunnel
+    sleep 5
+    show_cf_domain
 }
 
 uninstall_cloudflare() {
+    systemctl stop cloudflared-tunnel 2>/dev/null
+    systemctl disable cloudflared-tunnel 2>/dev/null
+    rm -f /etc/systemd/system/cloudflared-tunnel.service /usr/local/bin/cloudflared "$CF_DOMAIN_FILE"
+    systemctl daemon-reload
+    echo -e "  ${GREEN}[✓] cloudflared removed.${NC}"
+    log "cloudflared uninstalled"
+    read -rp "  Press Enter..."; cloudflare_menu
+}
+
+# ── [5] Payload Configurator ──────────────────────────────────────
+
+payload_configurator() {
     banner
-    echo -ne "  ${YELLOW}Remove cloudflared completely? (y/N): ${NC}"
-    read -r CONFIRM
-    if [[ "${CONFIRM,,}" != "y" ]]; then
-        cloudflare_menu; return
+    local CURRENT; CURRENT=$(cat "$PAYLOAD_FILE" 2>/dev/null)
+    echo -e "${CYAN}  [*] NPV Tunnel Payload Configurator${NC}\n"
+    echo -e "  Current payload:"
+    echo -e "  ${CYAN}${CURRENT}${NC}\n"
+    echo -e "  ${WHITE}Common payloads for NPV Tunnel:${NC}"
+    echo -e "  ${GREEN}[1]${NC} GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]"
+    echo -e "  ${GREEN}[2]${NC} CONNECT [host]:22 HTTP/1.1[crlf]Host: [host][crlf][crlf]"
+    echo -e "  ${GREEN}[3]${NC} GET wss://[host]/ HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]"
+    echo -e "  ${GREEN}[4]${NC} GET / HTTP/1.1[crlf]Host: [host][crlf]X-Forward-Host: [host][crlf]Upgrade: websocket[crlf][crlf]"
+    echo -e "  ${GREEN}[5]${NC} Enter custom payload"
+    echo -e "  ${RED}[0]${NC} Back\n"
+    echo -ne "  ${YELLOW}Select: ${NC}"; read -r OPT
+    case $OPT in
+        1) PAYLOAD="GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]" ;;
+        2) PAYLOAD="CONNECT [host]:22 HTTP/1.1[crlf]Host: [host][crlf][crlf]" ;;
+        3) PAYLOAD="GET wss://[host]/ HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]" ;;
+        4) PAYLOAD="GET / HTTP/1.1[crlf]Host: [host][crlf]X-Forward-Host: [host][crlf]Upgrade: websocket[crlf][crlf]" ;;
+        5) echo -ne "  Enter payload (use [crlf] for line breaks): "; read -r PAYLOAD ;;
+        0) main_menu; return ;;
+        *) payload_configurator; return ;;
+    esac
+    echo "$PAYLOAD" > "$PAYLOAD_FILE"
+    echo -e "  ${GREEN}[✓] Payload saved!${NC}"
+    log "Payload updated: $PAYLOAD"
+    read -rp "  Press Enter..."; main_menu
+}
+
+# ── [6] User Management ───────────────────────────────────────────
+
+user_management_menu() {
+    banner
+    echo -e "${WHITE}  ┌──────────────────────────────────────┐${NC}"
+    echo -e "${WHITE}  │        USER MANAGEMENT               │${NC}"
+    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[1]${WHITE} Create User                      │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[2]${WHITE} Delete User                      │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[3]${WHITE} Extend Expiry                    │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[4]${WHITE} Lock / Unlock User               │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[5]${WHITE} Kill User Sessions                │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[6]${WHITE} List All Users                   │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[7]${WHITE} Check User Details               │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[8]${WHITE} Run Expiry Cleanup Now           │${NC}"
+    echo -e "${WHITE}  │ ${RED}[0]${WHITE} Back                             │${NC}"
+    echo -e "${WHITE}  └──────────────────────────────────────┘${NC}"
+    echo -ne "\n  ${YELLOW}Select: ${NC}"; read -r OPT
+    case $OPT in
+        1) create_user ;;
+        2) delete_user ;;
+        3) extend_user ;;
+        4) lock_unlock_user ;;
+        5) kill_user_sessions ;;
+        6) list_users ;;
+        7) check_user ;;
+        8) run_expiry_cleanup; read -rp "  Press Enter..."; user_management_menu ;;
+        0) main_menu ;;
+        *) user_management_menu ;;
+    esac
+}
+
+create_user() {
+    banner
+    echo -e "${CYAN}  [*] Create NPV Tunnel User${NC}\n"
+    echo -ne "  ${YELLOW}Username  : ${NC}"; read -r USERNAME
+    [[ -z "$USERNAME" ]] && { echo -e "${RED}Empty.${NC}"; sleep 1; user_management_menu; return; }
+    id "$USERNAME" &>/dev/null && { echo -e "${RED}User exists.${NC}"; sleep 2; user_management_menu; return; }
+
+    echo -ne "  ${YELLOW}Password  : ${NC}"; read -rs PASSWORD; echo
+    [[ -z "$PASSWORD" ]] && { echo -e "${RED}Empty.${NC}"; sleep 1; user_management_menu; return; }
+
+    echo -ne "  ${YELLOW}Days      [30]: ${NC}"; read -r DAYS; DAYS=${DAYS:-30}
+    echo -ne "  ${YELLOW}Max logins [2]: ${NC}"; read -r MAX_LOGIN; MAX_LOGIN=${MAX_LOGIN:-2}
+
+    local EXPIRY; EXPIRY=$(date -d "+${DAYS} days" '+%Y-%m-%d')
+
+    # Always /bin/false — VPN-only, no terminal access
+    useradd -M -s /bin/false -e "$EXPIRY" "$USERNAME" >> "$LOG_FILE" 2>&1
+    echo "$USERNAME:$PASSWORD" | chpasswd >> "$LOG_FILE" 2>&1
+
+    # Enforce max login limit via ~/.ssh/authorized_keys isn't applicable here.
+    # We enforce via cron-based connection checker instead.
+    echo "${USERNAME}|${PASSWORD}|${EXPIRY}|${MAX_LOGIN}|$(date '+%Y-%m-%d')|active" >> "$USER_DB"
+
+    local IP; IP=$(get_public_ip)
+    local WS_P; WS_P=$(get_ws_port)
+    local PAYLOAD; PAYLOAD=$(cat "$PAYLOAD_FILE" 2>/dev/null)
+    local CF_DOM; CF_DOM=$(cat "$CF_DOMAIN_FILE" 2>/dev/null | sed 's|https://||')
+
+    echo -e "\n  ${GREEN}[✓] User created!${NC}"
+    echo -e "  ${WHITE}┌──────────────────────────────────────────────────────┐"
+    echo -e "  │  NPV Tunnel Account Details                          │"
+    echo -e "  ├──────────────────────────────────────────────────────┤"
+    echo -e "  │  Username  : ${USERNAME}"
+    echo -e "  │  Password  : ${PASSWORD}"
+    echo -e "  │  Expires   : ${EXPIRY} (${DAYS} days)"
+    echo -e "  │  Max Login : ${MAX_LOGIN}"
+    echo -e "  ├──────────────────────────────────────────────────────┤"
+    echo -e "  │  SSH Host  : ${IP}   SSH Port: 22"
+    echo -e "  │  WS Host   : ${IP}   WS Port : ${WS_P}"
+    echo -e "  │  TLS Port  : 443"
+    [[ -n "$CF_DOM" ]] && echo -e "  │  CF Domain : ${CF_DOM}"
+    echo -e "  │  Payload   : ${PAYLOAD}"
+    echo -e "  └──────────────────────────────────────────────────────┘${NC}"
+    log "User created: $USERNAME expires $EXPIRY"
+    read -rp "  Press Enter..."; user_management_menu
+}
+
+delete_user() {
+    banner
+    echo -ne "  ${YELLOW}Username to delete: ${NC}"; read -r USERNAME
+    ! id "$USERNAME" &>/dev/null && { echo -e "${RED}Not found.${NC}"; sleep 2; user_management_menu; return; }
+    echo -ne "  ${YELLOW}Confirm delete '${USERNAME}'? (y/N): ${NC}"; read -r C
+    [[ "${C,,}" != "y" ]] && { user_management_menu; return; }
+    pkill -u "$USERNAME" 2>/dev/null
+    userdel -f "$USERNAME" >> "$LOG_FILE" 2>&1
+    sed -i "/^${USERNAME}|/d" "$USER_DB"
+    echo -e "  ${GREEN}[✓] Deleted.${NC}"; log "User deleted: $USERNAME"
+    read -rp "  Press Enter..."; user_management_menu
+}
+
+extend_user() {
+    banner
+    echo -ne "  ${YELLOW}Username: ${NC}"; read -r USERNAME
+    ! id "$USERNAME" &>/dev/null && { echo -e "${RED}Not found.${NC}"; sleep 2; user_management_menu; return; }
+    echo -ne "  ${YELLOW}Extend by days [30]: ${NC}"; read -r DAYS; DAYS=${DAYS:-30}
+
+    local CUR_EXP; CUR_EXP=$(chage -l "$USERNAME" 2>/dev/null | grep "Account expires" | awk -F': ' '{print $2}')
+    local NEW_EXP
+    if [[ "$CUR_EXP" == "never" || -z "$CUR_EXP" ]]; then
+        NEW_EXP=$(date -d "+${DAYS} days" '+%Y-%m-%d')
+    else
+        NEW_EXP=$(date -d "$CUR_EXP +${DAYS} days" '+%Y-%m-%d' 2>/dev/null || date -d "+${DAYS} days" '+%Y-%m-%d')
     fi
 
-    systemctl stop cloudflared-tunnel >> "$LOG_FILE" 2>&1
-    systemctl disable cloudflared-tunnel >> "$LOG_FILE" 2>&1
-    rm -f /etc/systemd/system/cloudflared-tunnel.service
-    systemctl daemon-reload
-    rm -f /usr/local/bin/cloudflared
-    rm -f "$CF_DOMAIN_FILE"
-
-    echo -e "  ${GREEN}[✓] cloudflared uninstalled.${NC}"
-    log "cloudflared uninstalled"
-    read -rp "  Press Enter to continue..."
-    main_menu
+    chage -E "$NEW_EXP" "$USERNAME"
+    # Update USER_DB
+    sed -i "s/^${USERNAME}|\([^|]*\)|\([^|]*\)|/\1|\2|${NEW_EXP}|/" "$USER_DB"
+    echo -e "  ${GREEN}[✓] Extended to ${NEW_EXP}.${NC}"; log "Extended: $USERNAME → $NEW_EXP"
+    read -rp "  Press Enter..."; user_management_menu
 }
+
+lock_unlock_user() {
+    banner
+    echo -ne "  ${YELLOW}Username: ${NC}"; read -r USERNAME
+    ! id "$USERNAME" &>/dev/null && { echo -e "${RED}Not found.${NC}"; sleep 2; user_management_menu; return; }
+    local ST; ST=$(passwd -S "$USERNAME" 2>/dev/null | awk '{print $2}')
+    if [[ "$ST" == "L" || "$ST" == "LK" ]]; then
+        passwd -u "$USERNAME" >> "$LOG_FILE" 2>&1
+        echo -e "  ${GREEN}[✓] Unlocked.${NC}"; log "Unlocked: $USERNAME"
+    else
+        passwd -l "$USERNAME" >> "$LOG_FILE" 2>&1
+        pkill -u "$USERNAME" 2>/dev/null
+        echo -e "  ${YELLOW}[✓] Locked + sessions killed.${NC}"; log "Locked: $USERNAME"
+    fi
+    read -rp "  Press Enter..."; user_management_menu
+}
+
+kill_user_sessions() {
+    banner
+    echo -ne "  ${YELLOW}Username (blank = all): ${NC}"; read -r USERNAME
+    if [[ -z "$USERNAME" ]]; then
+        who | awk '{print $1}' | sort -u | while read -r U; do pkill -u "$U" 2>/dev/null; done
+        echo -e "  ${GREEN}[✓] All sessions killed.${NC}"
+    else
+        pkill -u "$USERNAME" 2>/dev/null && echo -e "  ${GREEN}[✓] Sessions for '${USERNAME}' killed.${NC}" \
+            || echo -e "  ${YELLOW}No sessions found.${NC}"
+    fi
+    log "Sessions killed: ${USERNAME:-all}"
+    read -rp "  Press Enter..."; user_management_menu
+}
+
+list_users() {
+    banner
+    echo -e "${CYAN}  [*] All VPN Users${NC}\n"
+    printf "  ${WHITE}%-15s %-12s %-12s %-8s %-8s %-8s${NC}\n" "User" "Expires" "Created" "MaxConn" "Online" "Status"
+    echo -e "  ${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+    while IFS='|' read -r U PASS EXP MAXL CREATED STATUS; do
+        [[ -z "$U" ]] && continue
+        local ONLINE; ONLINE=$(who 2>/dev/null | grep -c "^${U} " || echo 0)
+        local LOCK; LOCK=$(passwd -S "$U" 2>/dev/null | awk '{print $2}')
+        local DAYS_LEFT; DAYS_LEFT=$(( ( $(date -d "$EXP" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+        local ST_CLR
+        if [[ "$LOCK" == "L" || "$LOCK" == "LK" ]]; then ST_CLR="${RED}Locked${NC}"
+        elif [[ "$DAYS_LEFT" -lt 0 ]]; then ST_CLR="${RED}Expired${NC}"
+        elif [[ "$DAYS_LEFT" -lt 3 ]]; then ST_CLR="${YELLOW}Expiring${NC}"
+        else ST_CLR="${GREEN}Active${NC}"; fi
+        printf "  %-15s %-12s %-12s %-8s " "$U" "$EXP" "$CREATED" "$MAXL"
+        printf "%-8s " "$ONLINE"
+        echo -e "$ST_CLR"
+    done < "$USER_DB"
+
+    echo -e "  ${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  Total: $(wc -l < "$USER_DB") users  |  Online: $(who 2>/dev/null | wc -l) sessions"
+    read -rp "  Press Enter..."; user_management_menu
+}
+
+check_user() {
+    banner
+    echo -ne "  ${YELLOW}Username: ${NC}"; read -r USERNAME
+    ! id "$USERNAME" &>/dev/null && { echo -e "${RED}Not found.${NC}"; sleep 2; user_management_menu; return; }
+    local LINE; LINE=$(grep "^${USERNAME}|" "$USER_DB" 2>/dev/null)
+    local EXP;     EXP=$(echo "$LINE"     | cut -d'|' -f3)
+    local MAXL;    MAXL=$(echo "$LINE"    | cut -d'|' -f4)
+    local CREATED; CREATED=$(echo "$LINE" | cut -d'|' -f5)
+    local ONLINE;  ONLINE=$(who 2>/dev/null | grep -c "^${USERNAME} " || echo 0)
+    local LOCK;    LOCK=$(passwd -S "$USERNAME" 2>/dev/null | awk '{print $2}')
+    local DAYS_LEFT; DAYS_LEFT=$(( ( $(date -d "$EXP" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+    [[ "$LOCK" == "L" || "$LOCK" == "LK" ]] && STATUS="Locked" || STATUS="Active"
+    echo -e "  ${WHITE}┌──────────────────────────────────────┐"
+    echo -e "  │  Username  : ${USERNAME}"
+    echo -e "  │  Status    : ${STATUS}"
+    echo -e "  │  Created   : ${CREATED:-N/A}"
+    echo -e "  │  Expires   : ${EXP:-N/A}"
+    echo -e "  │  Days Left : ${DAYS_LEFT}"
+    echo -e "  │  Max Login : ${MAXL:-N/A}"
+    echo -e "  │  Online    : ${ONLINE} session(s)"
+    echo -e "  │  Shell     : $(getent passwd "$USERNAME" | cut -d: -f7)"
+    echo -e "  └──────────────────────────────────────┘${NC}"
+    read -rp "  Press Enter..."; user_management_menu
+}
+
+# ── Auto-expiry cron ──────────────────────────────────────────────
+
+setup_expiry_cron() {
+    cat > /usr/local/bin/ssh-vpn-expiry.sh << 'CRONSH'
+#!/bin/bash
+USER_DB="/etc/ssh-vpn-panel/users.db"
+LOG="/var/log/ssh-vpn-panel.log"
+TODAY=$(date +%s)
+
+while IFS='|' read -r U PASS EXP MAXL CREATED STATUS; do
+    [[ -z "$U" ]] && continue
+    ! id "$U" &>/dev/null && continue
+    EXP_TS=$(date -d "$EXP" +%s 2>/dev/null || echo 0)
+    if [[ "$EXP_TS" -lt "$TODAY" ]]; then
+        pkill -u "$U" 2>/dev/null
+        passwd -l "$U" >> "$LOG" 2>&1
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] AUTO-EXPIRED: $U (expired $EXP)" >> "$LOG"
+    fi
+    # Enforce max login limit
+    ONLINE=$(who 2>/dev/null | grep -c "^${U} " || echo 0)
+    if [[ "$ONLINE" -gt "$MAXL" ]]; then
+        EXCESS=$((ONLINE - MAXL))
+        # Kill the oldest excess sessions
+        who 2>/dev/null | grep "^${U} " | head -"$EXCESS" | awk '{print $2}' | \
+            while read -r TTY; do fuser -k "/dev/${TTY}" 2>/dev/null; done
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] LOGIN LIMIT: $U exceeded $MAXL logins, killed $EXCESS" >> "$LOG"
+    fi
+done < "$USER_DB"
+CRONSH
+    chmod +x /usr/local/bin/ssh-vpn-expiry.sh
+
+    # Run every 5 minutes
+    if ! crontab -l 2>/dev/null | grep -q 'ssh-vpn-expiry'; then
+        (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/ssh-vpn-expiry.sh") | crontab -
+    fi
+}
+
+run_expiry_cleanup() {
+    echo -e "${CYAN}  [*] Running expiry cleanup...${NC}"
+    bash /usr/local/bin/ssh-vpn-expiry.sh
+    echo -e "  ${GREEN}[✓] Done. Check logs for details.${NC}"
+    log "Manual expiry cleanup run"
+}
+
+# ── [7] Live Monitor ──────────────────────────────────────────────
+
+monitor_connections() {
+    echo -e "${YELLOW}  Live monitor — Ctrl+C to stop${NC}"
+    while true; do
+        banner
+        echo -e "${CYAN}  Active Sessions — $(date '+%H:%M:%S')${NC}\n"
+        printf "  ${WHITE}%-15s %-20s %-10s${NC}\n" "User" "From" "Since"
+        echo -e "  ${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        local COUNT=0
+        while IFS= read -r LINE; do
+            local U; U=$(echo "$LINE" | awk '{print $1}')
+            local FROM; FROM=$(echo "$LINE" | awk '{print $3}' | tr -d '()')
+            local SINCE; SINCE=$(echo "$LINE" | awk '{print $4, $5}')
+            # Get max login for this user
+            local MAXL; MAXL=$(grep "^${U}|" "$USER_DB" 2>/dev/null | cut -d'|' -f4)
+            local ONLINE; ONLINE=$(who 2>/dev/null | grep -c "^${U} " || echo 0)
+            local WARN=""
+            [[ -n "$MAXL" && "$ONLINE" -ge "$MAXL" ]] && WARN=" ${RED}[LIMIT]${NC}"
+            printf "  %-15s %-20s %-10s" "$U" "$FROM" "$SINCE"
+            echo -e "$WARN"
+            ((COUNT++))
+        done < <(who 2>/dev/null)
+        echo -e "  ${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "  Total: ${GREEN}${COUNT}${NC} session(s)   Refresh: 5s   Ctrl+C = exit"
+        sleep 5
+    done
+}
+
+# ── [8] Connection Details ────────────────────────────────────────
+
+show_connection_details() {
+    banner
+    local IP; IP=$(get_public_ip)
+    local WS_P; WS_P=$(get_ws_port)
+    local CF_DOM; CF_DOM=$(cat "$CF_DOMAIN_FILE" 2>/dev/null | sed 's|https://||' || echo "Not configured")
+    local PAYLOAD; PAYLOAD=$(cat "$PAYLOAD_FILE" 2>/dev/null)
+
+    echo -e "  ${WHITE}┌──────────────────────────────────────────────────────────┐"
+    echo -e "  │            NPV TUNNEL CONNECTION CONFIG                  │"
+    echo -e "  ├──────────────────────────────────────────────────────────┤"
+    echo -e "  │  [SSH over WebSocket]"
+    echo -e "  │  SSH Host  : ${IP}"
+    echo -e "  │  SSH Port  : 22"
+    echo -e "  │  WS Host   : ${IP}"
+    echo -e "  │  WS Port   : ${WS_P}"
+    echo -e "  │  Payload   : ${PAYLOAD}"
+    echo -e "  ├──────────────────────────────────────────────────────────┤"
+    echo -e "  │  [SSH over TLS — Stunnel]"
+    echo -e "  │  SSH Host  : 127.0.0.1   SSH Port: 22"
+    echo -e "  │  TLS Host  : ${IP}   TLS Port: 443"
+    echo -e "  │  TLS Cert  : Skip verify"
+    echo -e "  ├──────────────────────────────────────────────────────────┤"
+    echo -e "  │  [Cloudflare (no IP blocking)]"
+    echo -e "  │  SSH Host  : ${IP}   SSH Port: 22"
+    echo -e "  │  WS Host   : ${CF_DOM}"
+    echo -e "  │  WS Port   : 443"
+    echo -e "  └──────────────────────────────────────────────────────────┘${NC}"
+
+    echo -e "\n  ${YELLOW}Services:${NC}"
+    for S in ssh ssh-ws ssh-wss stunnel4 cloudflared-tunnel; do
+        if systemctl is-active --quiet "$S" 2>/dev/null; then
+            echo -e "  ${GREEN}[✓] ${S}${NC}"
+        else
+            echo -e "  ${RED}[✗] ${S} — not running${NC}"
+        fi
+    done
+    read -rp "  Press Enter..."; main_menu
+}
+
+# ── [9] Service Control ───────────────────────────────────────────
+
+service_control_menu() {
+    banner
+    echo -e "${WHITE}  ┌──────────────────────────────────────┐${NC}"
+    echo -e "${WHITE}  │        SERVICE CONTROL               │${NC}"
+    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
+    for S in ssh ssh-ws ssh-wss stunnel4 cloudflared-tunnel; do
+        local ST; ST=$(svc_status "$S")
+        printf "  │  %b %-28s│\n" "$ST" "$S"
+    done
+    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[1]${WHITE} Restart ALL Services             │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[2]${WHITE} Restart SSH-WS                  │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[3]${WHITE} Restart Stunnel (TLS)           │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[4]${WHITE} Restart Cloudflare Tunnel       │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[5]${WHITE} Restart SSH daemon               │${NC}"
+    echo -e "${WHITE}  │ ${RED}[0]${WHITE} Back                             │${NC}"
+    echo -e "${WHITE}  └──────────────────────────────────────┘${NC}"
+    echo -ne "\n  ${YELLOW}Select: ${NC}"; read -r OPT
+    case $OPT in
+        1) systemctl restart ssh ssh-ws ssh-wss stunnel4 cloudflared-tunnel 2>/dev/null
+           echo -e "  ${GREEN}[✓] All services restarted.${NC}" ;;
+        2) systemctl restart ssh-ws ssh-wss; echo -e "  ${GREEN}[✓] SSH-WS restarted.${NC}" ;;
+        3) systemctl restart stunnel4; echo -e "  ${GREEN}[✓] Stunnel restarted.${NC}" ;;
+        4) systemctl restart cloudflared-tunnel; echo -e "  ${GREEN}[✓] Cloudflare restarted.${NC}" ;;
+        5) systemctl restart ssh; echo -e "  ${GREEN}[✓] SSH restarted.${NC}" ;;
+        0) main_menu; return ;;
+    esac
+    sleep 1; service_control_menu
+}
+
+# ── [L] Log Viewer ────────────────────────────────────────────────
+
+log_viewer() {
+    banner
+    echo -e "${WHITE}  ┌──────────────────────────────────────┐${NC}"
+    echo -e "${WHITE}  │            LOG VIEWER                │${NC}"
+    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[1]${WHITE} Panel Logs (last 30)             │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[2]${WHITE} SSH Auth Logs (last 30)          │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[3]${WHITE} WS Service Logs (last 30)        │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[4]${WHITE} Stunnel Logs (last 30)           │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[5]${WHITE} Cloudflare Logs (last 30)        │${NC}"
+    echo -e "${WHITE}  │ ${RED}[0]${WHITE} Back                             │${NC}"
+    echo -e "${WHITE}  └──────────────────────────────────────┘${NC}"
+    echo -ne "\n  ${YELLOW}Select: ${NC}"; read -r OPT
+    case $OPT in
+        1) tail -n 30 "$LOG_FILE" 2>/dev/null || echo "No logs yet" ;;
+        2) tail -n 30 /var/log/auth.log 2>/dev/null || journalctl -u ssh -n 30 --no-pager ;;
+        3) journalctl -u ssh-ws -n 30 --no-pager ;;
+        4) tail -n 30 /var/log/stunnel4/stunnel.log 2>/dev/null || echo "No stunnel logs" ;;
+        5) journalctl -u cloudflared-tunnel -n 30 --no-pager ;;
+        0) main_menu; return ;;
+    esac
+    read -rp "  Press Enter..."; log_viewer
+}
+
+# ── [B] Backup / Restore ──────────────────────────────────────────
+
+backup_restore_menu() {
+    banner
+    echo -e "${WHITE}  ┌──────────────────────────────────────┐${NC}"
+    echo -e "${WHITE}  │        BACKUP / RESTORE              │${NC}"
+    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[1]${WHITE} Create Backup                    │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[2]${WHITE} Restore from Backup              │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[3]${WHITE} List Backups                     │${NC}"
+    echo -e "${WHITE}  │ ${RED}[0]${WHITE} Back                             │${NC}"
+    echo -e "${WHITE}  └──────────────────────────────────────┘${NC}"
+    echo -ne "\n  ${YELLOW}Select: ${NC}"; read -r OPT
+    case $OPT in
+        1) create_backup ;;
+        2) restore_backup ;;
+        3) ls -lh /root/ragnar-backup-*.tar.gz 2>/dev/null || echo "  No backups found."
+           read -rp "  Press Enter..."; backup_restore_menu ;;
+        0) main_menu ;;
+        *) backup_restore_menu ;;
+    esac
+}
+
+create_backup() {
+    local BK="/root/ragnar-backup-$(date '+%Y%m%d-%H%M%S').tar.gz"
+    tar -czf "$BK" "$CONFIG_DIR" /etc/ssh/sshd_config /etc/stunnel 2>/dev/null
+    echo -e "  ${GREEN}[✓] Backup saved: ${BK}${NC}"
+    log "Backup created: $BK"
+    read -rp "  Press Enter..."; backup_restore_menu
+}
+
+restore_backup() {
+    echo -ne "  ${YELLOW}Backup file path: ${NC}"; read -r BK_PATH
+    [[ ! -f "$BK_PATH" ]] && { echo -e "${RED}File not found.${NC}"; sleep 2; backup_restore_menu; return; }
+    tar -xzf "$BK_PATH" -C / >> "$LOG_FILE" 2>&1
+    systemctl restart ssh ssh-ws ssh-wss stunnel4 2>/dev/null
+    echo -e "  ${GREEN}[✓] Restored from ${BK_PATH}.${NC}"
+    log "Restored from: $BK_PATH"
+    read -rp "  Press Enter..."; backup_restore_menu
+}
+
+# ── [I] System Info ───────────────────────────────────────────────
+
+system_info() {
+    banner
+    local OS_INFO; OS_INFO=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
+    local UPTIME; UPTIME=$(uptime -p 2>/dev/null || uptime)
+    local CPU; CPU=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || echo "N/A")
+    local MEM_T; MEM_T=$(free -m | awk 'NR==2{print $2}')
+    local MEM_U; MEM_U=$(free -m | awk 'NR==2{print $3}')
+    local DISK; DISK=$(df -h / | awk 'NR==2{print $3"/"$2" ("$5")"}')
+    echo -e "  ${WHITE}┌──────────────────────────────────────┐"
+    echo -e "  │  OS      : ${OS_INFO}"
+    echo -e "  │  Kernel  : $(uname -r)"
+    echo -e "  │  Uptime  : ${UPTIME}"
+    echo -e "  │  CPU     : ${CPU}%"
+    echo -e "  │  RAM     : ${MEM_U} MB / ${MEM_T} MB"
+    echo -e "  │  Disk    : ${DISK}"
+    echo -e "  │  Users   : $(wc -l < "$USER_DB") VPN users"
+    echo -e "  │  Online  : $(who 2>/dev/null | wc -l) sessions"
+    echo -e "  └──────────────────────────────────────┘${NC}"
+    read -rp "  Press Enter..."; main_menu
+}
+
+# ── [U] Update ────────────────────────────────────────────────────
 
 update_panel() {
     banner
-    echo -e "${CYAN}  [*] Update Panel${NC}\n"
+    echo -e "${CYAN}  [*] Checking for updates...${NC}\n"
+    local REMOTE_URL="${REPO_RAW}/panel.sh"
+    local CURRENT_SCRIPT="$INSTALL_DIR/panel.sh"
 
-    REMOTE_URL="https://raw.githubusercontent.com/faresbazed/Ragnar-ssh-panel-script/main/panel.sh"
-    INSTALL_DIR="/usr/local/ssh-vpn-panel"
-    CURRENT_SCRIPT="$INSTALL_DIR/panel.sh"
-    BACKUP="$INSTALL_DIR/panel.sh.bak"
+    local NEW_VER; NEW_VER=$(curl -sSL "$REMOTE_URL" 2>/dev/null | grep 'PANEL_VERSION=' | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+    [[ -z "$NEW_VER" ]] && { echo -e "${RED}Cannot reach update server.${NC}"; read -rp "Enter..."; main_menu; return; }
 
-    echo -e "${YELLOW}  [1/4] Checking for updates...${NC}"
-    NEW_VERSION=$(curl -sSL "$REMOTE_URL" 2>/dev/null | grep 'PANEL_VERSION=' | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+    echo -e "  Current : ${WHITE}v${PANEL_VERSION}${NC}"
+    echo -e "  Latest  : ${WHITE}v${NEW_VER}${NC}\n"
 
-    if [[ -z "$NEW_VERSION" ]]; then
-        echo -e "  ${RED}[✗] Could not reach update server. Check your internet connection.${NC}"
-        read -rp "  Press Enter to continue..."
-        main_menu; return
+    if [[ "$NEW_VER" == "$PANEL_VERSION" ]]; then
+        echo -e "  ${GREEN}[✓] Already up to date!${NC}"; read -rp "Enter..."; main_menu; return
     fi
 
-    echo -e "  Current version : ${WHITE}${PANEL_VERSION}${NC}"
-    echo -e "  Latest version  : ${WHITE}${NEW_VERSION}${NC}\n"
-
-    if [[ "$NEW_VERSION" == "$PANEL_VERSION" ]]; then
-        echo -e "  ${GREEN}[✓] You are already on the latest version!${NC}"
-        read -rp "  Press Enter to continue..."
-        main_menu; return
-    fi
-
-    echo -e "${YELLOW}  [2/4] Backing up current panel...${NC}"
-    cp "$CURRENT_SCRIPT" "$BACKUP" 2>/dev/null && \
-        echo -e "  ${GREEN}[✓] Backup saved to ${BACKUP}${NC}" || \
-        echo -e "  ${YELLOW}[!] No existing install found, fresh update.${NC}"
-
-    echo -e "${YELLOW}  [3/4] Downloading latest version...${NC}"
-    curl -sSL "$REMOTE_URL" -o "$CURRENT_SCRIPT.tmp"
-
-    if [[ ! -s "$CURRENT_SCRIPT.tmp" ]]; then
-        echo -e "  ${RED}[✗] Download failed. Keeping current version.${NC}"
-        rm -f "$CURRENT_SCRIPT.tmp"
-        read -rp "  Press Enter to continue..."
-        main_menu; return
-    fi
-
-    mv "$CURRENT_SCRIPT.tmp" "$CURRENT_SCRIPT"
+    cp "$CURRENT_SCRIPT" "${CURRENT_SCRIPT}.bak" 2>/dev/null
+    curl -sSL "$REMOTE_URL" -o "${CURRENT_SCRIPT}.tmp"
+    [[ ! -s "${CURRENT_SCRIPT}.tmp" ]] && { echo -e "${RED}Download failed.${NC}"; rm -f "${CURRENT_SCRIPT}.tmp"; read -rp "Enter..."; main_menu; return; }
+    mv "${CURRENT_SCRIPT}.tmp" "$CURRENT_SCRIPT"
     chmod +x "$CURRENT_SCRIPT"
-
-    echo -e "${YELLOW}  [4/4] Reloading panel...${NC}"
-    echo -e "\n  ${GREEN}[✓] Panel updated to v${NEW_VERSION}!${NC}"
-    log "Panel updated from v${PANEL_VERSION} to v${NEW_VERSION}"
-
-    read -rp "  Press Enter to relaunch..."
+    echo -e "  ${GREEN}[✓] Updated to v${NEW_VER}! Relaunching...${NC}"
+    log "Panel updated v${PANEL_VERSION} → v${NEW_VER}"
+    read -rp "  Press Enter..."
     exec bash "$CURRENT_SCRIPT"
 }
+
+# ── [X] Uninstall ─────────────────────────────────────────────────
 
 uninstall_panel() {
     banner
     echo -e "${RED}  [!] UNINSTALL PANEL${NC}\n"
-    echo -e "${WHITE}  This will remove:"
-    echo -e "  - All panel files and services (SSH-WS, SSH-TLS, Cloudflare)"
-    echo -e "  - The 'vpn' shortcut command"
-    echo -e "  - Panel config and logs"
-    echo -e "${YELLOW}  SSH server itself will NOT be removed.${NC}\n"
+    echo -e "  Removes: WS proxy, Stunnel, Cloudflare, panel files, cron, 'vpn' command"
+    echo -e "  ${YELLOW}SSH server stays intact.${NC}\n"
+    echo -ne "  ${RED}Type UNINSTALL to confirm: ${NC}"; read -r C
+    [[ "$C" != "UNINSTALL" ]] && { main_menu; return; }
 
-    echo -ne "  ${RED}Type 'UNINSTALL' to confirm: ${NC}"
-    read -r CONFIRM
-    if [[ "$CONFIRM" != "UNINSTALL" ]]; then
-        echo -e "  ${YELLOW}Cancelled.${NC}"
-        sleep 1; main_menu; return
-    fi
-
-    echo -e "\n${YELLOW}  [1/6] Stopping Cloudflare tunnel...${NC}"
-    systemctl stop cloudflared-tunnel 2>/dev/null
-    systemctl disable cloudflared-tunnel 2>/dev/null
-    rm -f /etc/systemd/system/cloudflared-tunnel.service
-    rm -f /usr/local/bin/cloudflared
-
-    echo -e "${YELLOW}  [2/6] Stopping SSH-WebSocket services...${NC}"
-    systemctl stop ssh-ws ssh-wss 2>/dev/null
-    systemctl disable ssh-ws ssh-wss 2>/dev/null
-    rm -f /etc/systemd/system/ssh-ws.service
-    rm -f /etc/systemd/system/ssh-wss.service
-    rm -f /usr/local/bin/ssh-ws-proxy.py
-
-    echo -e "${YELLOW}  [3/6] Stopping Stunnel...${NC}"
-    systemctl stop stunnel4 2>/dev/null
-    systemctl disable stunnel4 2>/dev/null
-
-    echo -e "${YELLOW}  [4/6] Reloading systemd...${NC}"
+    for SVC in cloudflared-tunnel ssh-ws ssh-wss stunnel4; do
+        systemctl stop "$SVC" 2>/dev/null
+        systemctl disable "$SVC" 2>/dev/null
+        rm -f "/etc/systemd/system/${SVC}.service"
+    done
     systemctl daemon-reload
-
-    echo -e "${YELLOW}  [5/6] Removing panel files and config...${NC}"
-    rm -rf "$CONFIG_DIR"
-    rm -rf /usr/local/ssh-vpn-panel
-    rm -f "$LOG_FILE"
-
-    echo -e "${YELLOW}  [6/6] Removing 'vpn' command...${NC}"
+    rm -f /usr/local/bin/cloudflared /usr/local/bin/ssh-ws-proxy.py /usr/local/bin/ssh-vpn-expiry.sh
+    rm -rf "$CONFIG_DIR" "$INSTALL_DIR" "$LOG_FILE"
     rm -f /usr/local/bin/vpn
+    # Remove cron entry
+    crontab -l 2>/dev/null | grep -v 'ssh-vpn-expiry' | crontab -
 
-    echo -e "\n  ${GREEN}[✓] SSH VPN Panel has been fully uninstalled.${NC}"
-    echo -e "  ${WHITE}SSH server is still running. Goodbye!${NC}\n"
-    log "Panel uninstalled"
+    echo -e "\n  ${GREEN}[✓] Panel fully uninstalled.${NC}\n"
     exit 0
 }
+
+# ── Entry ─────────────────────────────────────────────────────────
 
 check_root
 init_panel
