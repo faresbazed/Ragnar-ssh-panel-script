@@ -252,14 +252,21 @@ deploy_ws_proxy() {
     cat > /usr/local/bin/ssh-ws-proxy.py << 'PYEOF'
 #!/usr/bin/env python3
 """
-Ragnar SSH-WebSocket Proxy v4 — Universal NPV Tunnel Handler
+Ragnar SSH-WebSocket Proxy v4.1 — Universal NPV Tunnel Handler
 
-Non-destructive MSG_PEEK protocol detection. Handles:
-  GET, POST, CONNECT, CF-RAY, any custom method, raw SSH, binary.
-Double-header NPV sequences handled with 3s grace period.
-IPv6 dual-stack (covers both :: and 0.0.0.0 in one socket).
+Handles: GET, POST, CONNECT, CF-RAY, any custom HTTP method, raw SSH, binary.
+
+NPV Tunnel payload flow supported:
+  Segment 1:  GET / HTTP/1.1\r\nHost: fake.host\r\n\r\n
+  Segment 2:  CF-RAY / HTTP/1.1\r\nHost: [host]\r\nUpgrade: websocket\r\n...\r\n\r\n
+
+Key improvements over v4:
+  - Phase-2 reader loops until second \\r\\n\\r\\n arrives (not just one recv)
+  - 3 s rolling deadline for the second segment
+  - Post-response drain loops until no more HTTP bytes arrive
+  - Explicit CF-RAY detection in choose_response for clarity
 """
-import socket, threading, select, sys
+import socket, threading, select, sys, time
 
 SSH_HOST = '127.0.0.1'
 SSH_PORT = 22
@@ -271,6 +278,8 @@ WS_101      = (b"HTTP/1.1 101 Switching Protocols\r\n"
                b"Connection: Upgrade\r\n\r\n")
 CONNECT_200 = b"HTTP/1.1 200 Connection established\r\n\r\n"
 
+
+# ── Pipe ─────────────────────────────────────────────────────────
 
 def pipe(src, dst, stop):
     try:
@@ -289,69 +298,83 @@ def pipe(src, dst, stop):
 
 
 def relay(client, ssh, initial=b""):
-    """Bidirectional pipe; forward any initial bytes to SSH first."""
+    """Start bidirectional pipe; send initial bytes to SSH first."""
     try:
         if initial:
             ssh.sendall(initial)
     except Exception:
         return
     stop = threading.Event()
-    t1 = threading.Thread(target=pipe, args=(client, ssh, stop), daemon=True)
-    t2 = threading.Thread(target=pipe, args=(ssh, client, stop), daemon=True)
-    t1.start()
-    t2.start()
+    threading.Thread(target=pipe, args=(client, ssh, stop), daemon=True).start()
+    threading.Thread(target=pipe, args=(ssh, client, stop), daemon=True).start()
     stop.wait()
 
 
+# ── HTTP payload reader ───────────────────────────────────────────
+
 def read_http_request(sock):
     """
-    Read a complete HTTP request from the client.
+    Read the complete HTTP request from an NPV Tunnel client.
 
-    NPV Tunnel quirks handled:
-      - Double-segment: first segment GET/HEAD/etc + second CF-RAY/Upgrade segment
-      - We wait up to 3 s for the second segment, 1 s for a third
-      - Everything after the last \\r\\n\\r\\n is leftover SSH data
+    NPV sends a two-segment payload:
+      Segment 1  — GET or HEAD (may have no Upgrade header)
+      Segment 2  — CF-RAY or repeat GET with Upgrade: websocket
 
-    Returns: (headers_text: str, leftover: bytes)
+    Algorithm:
+      Phase 1: loop until first \\r\\n\\r\\n (5 s timeout)
+      Phase 2: loop with rolling 3 s deadline until second \\r\\n\\r\\n
+               (handles slow clients that trickle the second segment)
+      Phase 3: try 1 s for a rare third segment
+
+    Returns (all_headers_text, leftover_bytes_after_last_terminator)
     """
     buf = b""
+
+    # Phase 1 ─ get first complete segment
     sock.settimeout(5)
     try:
-        # Phase 1: read until we have a complete first segment
         while b'\r\n\r\n' not in buf and len(buf) < 65536:
             chunk = sock.recv(4096)
             if not chunk:
                 break
             buf += chunk
+    except socket.timeout:
+        pass
 
-        if b'\r\n\r\n' not in buf:
-            sock.settimeout(TIMEOUT)
-            return buf.decode('utf-8', errors='ignore'), b""
+    if b'\r\n\r\n' not in buf:
+        sock.settimeout(TIMEOUT)
+        return buf.decode('utf-8', errors='ignore'), b""
 
-        # Phase 2: NPV Tunnel second segment (CF-RAY / custom payload)
-        # Wait up to 3 s for it to arrive
-        sock.settimeout(3.0)
+    # Phase 2 ─ wait for second segment (rolling 3 s deadline)
+    deadline = time.monotonic() + 3.0
+    sock.settimeout(1.0)
+    try:
+        while time.monotonic() < deadline and buf.count(b'\r\n\r\n') < 2:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(min(1.0, remaining))
+            try:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            except socket.timeout:
+                break
+    except Exception:
+        pass
+
+    # Phase 3 ─ optional third segment (rare)
+    if buf.count(b'\r\n\r\n') >= 2:
+        sock.settimeout(1.0)
         try:
-            extra = sock.recv(4096)
-            if extra:
-                buf += extra
+            chunk = sock.recv(4096)
+            if chunk:
+                buf += chunk
         except socket.timeout:
             pass
 
-        # Phase 3: optional third segment (rare)
-        if buf.count(b'\r\n\r\n') >= 2:
-            sock.settimeout(1.0)
-            try:
-                extra = sock.recv(4096)
-                if extra:
-                    buf += extra
-            except socket.timeout:
-                pass
-
-    except socket.timeout:
-        pass
-    finally:
-        sock.settimeout(TIMEOUT)
+    sock.settimeout(TIMEOUT)
 
     last_end = buf.rfind(b'\r\n\r\n')
     if last_end >= 0:
@@ -363,41 +386,69 @@ def read_http_request(sock):
     return headers, leftover
 
 
+# ── Response chooser ─────────────────────────────────────────────
+
 def choose_response(headers):
-    """CONNECT -> 200; everything else (GET/POST/CF-RAY/custom) -> 101."""
+    """
+    CONNECT                  -> 200 Connection established
+    Upgrade: websocket       -> 101 Switching Protocols
+    CF-RAY / any custom      -> 101 Switching Protocols  (default)
+    POST / GET without WS    -> 101 Switching Protocols  (default)
+    """
     for line in headers.splitlines():
-        if line.strip().upper().startswith('CONNECT'):
+        stripped = line.strip()
+        if stripped.upper().startswith('CONNECT '):
             return CONNECT_200
     return WS_101
 
 
+# ── Drain late HTTP bytes ─────────────────────────────────────────
+
 def drain_late_http(sock):
     """
-    After sending 101/200, absorb any late-arriving stale HTTP bytes.
-    Real SSH handshake data (doesn't contain bare \\r\\n or starts with SSH-)
-    is returned as leftover.
+    After sending 101/200, absorb stale HTTP bytes NPV may send late.
+    Loops until timeout or the data looks like real SSH.
+    Returns any actual SSH handshake bytes that arrived.
     """
+    leftover = b""
     sock.settimeout(0.8)
     try:
-        chunk = sock.recv(4096)
-        if chunk:
-            if b'\r\n' in chunk[:256] and not chunk.lstrip().startswith(b'SSH-'):
-                end = chunk.find(b'\r\n\r\n')
-                return chunk[end + 4:] if end >= 0 else b""
-            return chunk
-    except socket.timeout:
-        pass
+        while True:
+            try:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                # Real SSH handshake starts with SSH- banner or binary > 0x7f
+                if chunk.lstrip().startswith(b'SSH-') or chunk[0] > 0x7f:
+                    leftover += chunk
+                    break
+                # Stale HTTP — contains \r\n but isn't SSH
+                if b'\r\n' in chunk[:256]:
+                    end = chunk.find(b'\r\n\r\n')
+                    if end >= 0:
+                        tail = chunk[end + 4:]
+                        if tail:
+                            leftover += tail
+                    # else: all HTTP, discard
+                else:
+                    # Ambiguous — keep it
+                    leftover += chunk
+                    break
+            except socket.timeout:
+                break
     finally:
         sock.settimeout(TIMEOUT)
-    return b""
+    return leftover
 
+
+# ── Connection handler ────────────────────────────────────────────
 
 def handle(client):
     ssh = None
     try:
         client.settimeout(TIMEOUT)
 
-        # Non-destructive peek — detect protocol without consuming bytes
+        # Non-destructive peek to detect the protocol
         client.settimeout(5)
         try:
             first = client.recv(4096, socket.MSG_PEEK)
@@ -409,29 +460,32 @@ def handle(client):
         if not first:
             return
 
-        # ── Case 1: Plain SSH client (sends banner like "SSH-2.0-OpenSSH...") ──
+        # ── Direct SSH (client speaks SSH-2.0 banner immediately) ──
         if first.lstrip()[:4] == b'SSH-':
             ssh = socket.create_connection((SSH_HOST, SSH_PORT), timeout=10)
             ssh.settimeout(TIMEOUT)
             relay(client, ssh)
             return
 
-        # ── Case 2: Any HTTP method (GET, POST, CONNECT, CF-RAY, etc.) ──
-        if b'\r\n' in first[:512] or b'HTTP' in first[:32] or b' / ' in first[:32]:
+        # ── Any HTTP request (GET / POST / CONNECT / CF-RAY / custom) ──
+        is_http = (b'\r\n' in first[:512] or
+                   b'HTTP' in first[:32]  or
+                   b' / ' in first[:32]   or
+                   b'CF-RAY' in first[:32])
+        if is_http:
             headers, leftover = read_http_request(client)
-            resp = choose_response(headers)
-            client.sendall(resp)
+            client.sendall(choose_response(headers))
 
             late = drain_late_http(client)
             if late:
-                leftover = leftover + late
+                leftover += late
 
             ssh = socket.create_connection((SSH_HOST, SSH_PORT), timeout=10)
             ssh.settimeout(TIMEOUT)
             relay(client, ssh, leftover)
             return
 
-        # ── Case 3: Binary / unknown — pipe directly ──
+        # ── Binary / unknown — pipe straight to SSH ──
         raw = client.recv(BUFFER)
         ssh = socket.create_connection((SSH_HOST, SSH_PORT), timeout=10)
         ssh.settimeout(TIMEOUT)
@@ -448,30 +502,30 @@ def handle(client):
                     pass
 
 
+# ── Server ───────────────────────────────────────────────────────
+
 def make_server(port):
-    """Create a listening socket, preferring IPv6 dual-stack."""
+    """IPv6 dual-stack preferred (covers both 0.0.0.0 and :: in one socket)."""
     if socket.has_ipv6:
         try:
-            srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-            srv.bind(('::', port))
-            return srv
+            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            s.bind(('::', port))
+            return s
         except Exception:
-            try:
-                srv.close()
-            except Exception:
-                pass
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('0.0.0.0', port))
-    return srv
+            try: s.close()
+            except Exception: pass
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('0.0.0.0', port))
+    return s
 
 
 def serve(port):
     srv = make_server(port)
     srv.listen(2048)
-    print(f"[Ragnar-WS v4] :{port} -> SSH:{SSH_PORT}", flush=True)
+    print(f"[Ragnar-WS v4.1] :{port} -> SSH:{SSH_PORT}", flush=True)
     while True:
         try:
             c, _ = srv.accept()
@@ -508,7 +562,7 @@ PYEOF
 
     cat > /etc/systemd/system/ssh-ws.service << SVCEOF
 [Unit]
-Description=Ragnar SSH-WebSocket Proxy v4 (port ${PORT})
+Description=Ragnar SSH-WebSocket Proxy v4.1 (port ${PORT})
 After=network.target ssh.service
 
 [Service]
@@ -526,7 +580,7 @@ SVCEOF
 
     cat > /etc/systemd/system/ssh-wss.service << 'SVCEOF2'
 [Unit]
-Description=Ragnar SSH-WebSocket Proxy v4 fallback (port 8880)
+Description=Ragnar SSH-WebSocket Proxy v4.1 fallback (port 8880)
 After=network.target ssh.service
 
 [Service]
