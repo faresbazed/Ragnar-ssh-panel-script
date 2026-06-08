@@ -35,7 +35,7 @@ vpn
 | Mode | Host | Port |
 |------|------|------|
 | SSH Direct | your-server-ip | 22 / 80 |
-| SSH WebSocket (WS) | your-server-ip | 8880 |
+| SSH WebSocket (WS) | your-server-ip | 80 |
 | SSH WebSocket (WSS) | your-server-ip | 8443 |
 | SSH over TLS | your-server-ip | 443 |
 
