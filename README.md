@@ -20,7 +20,25 @@ A full-featured SSH VPN panel script for Linux servers, compatible with **NPV Tu
 
 ## Quick Install
 
+### One-click (recommended)
+
+Run this single command on your server as root:
+
 ```bash
+bash <(curl -s https://raw.githubusercontent.com/faresbazed/Ragnar-ssh-panel-script/main/install.sh)
+```
+
+Or with wget:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/faresbazed/Ragnar-ssh-panel-script/main/install.sh | bash
+```
+
+### Manual install
+
+```bash
+git clone https://github.com/faresbazed/Ragnar-ssh-panel-script.git
+cd Ragnar-ssh-panel-script
 sudo bash install.sh
 ```
 
