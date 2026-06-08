@@ -697,32 +697,41 @@ setup_stunnel() {
 cloudflare_menu() {
     banner
     local CF_S; CF_S="$(svc_status cloudflared-tunnel) $(systemctl is-active cloudflared-tunnel 2>/dev/null)"
-    local CF_DOM; CF_DOM=$(cat "$CF_DOMAIN_FILE" 2>/dev/null || echo "None")
-    echo -e "${WHITE}  ┌──────────────────────────────────────┐${NC}"
-    echo -e "${WHITE}  │      CLOUDFLARE FREE DOMAIN          │${NC}"
-    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
-    echo -e "  │  Status : ${CF_S}"
-    echo -e "  │  Domain : ${CYAN}${CF_DOM}${NC}"
-    echo -e "${WHITE}  ├──────────────────────────────────────┤${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[1]${WHITE} Install & Start Tunnel            │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[2]${WHITE} Show Domain / NPV Config          │${NC}"
-    echo -e "${WHITE}  │ ${GREEN}[3]${WHITE} Restart (get new domain)          │${NC}"
-    echo -e "${WHITE}  │ ${RED}[4]${WHITE} Stop Tunnel                      │${NC}"
-    echo -e "${WHITE}  │ ${RED}[5]${WHITE} Uninstall cloudflared            │${NC}"
-    echo -e "${WHITE}  │ ${RED}[0]${WHITE} Back                             │${NC}"
-    echo -e "${WHITE}  └──────────────────────────────────────┘${NC}"
+    local CF_DOM;     CF_DOM=$(cat "$CF_DOMAIN_FILE"               2>/dev/null || echo "None")
+    local CF_CDN_DOM; CF_CDN_DOM=$(cat "$CONFIG_DIR/cf_cdn_domain.txt" 2>/dev/null || echo "None")
+    echo -e "${WHITE}  ┌──────────────────────────────────────────┐${NC}"
+    echo -e "${WHITE}  │           CLOUDFLARE MENU                │${NC}"
+    echo -e "${WHITE}  ├──────────────────────────────────────────┤${NC}"
+    echo -e "  │  Quick Tunnel : ${CYAN}${CF_DOM}${NC}"
+    echo -e "  │  CDN Domain   : ${CYAN}${CF_CDN_DOM}${NC}"
+    echo -e "${WHITE}  ├──────────────────────────────────────────┤${NC}"
+    echo -e "${WHITE}  │ ${CYAN}── Quick Tunnel (free, auto-domain) ─${WHITE}   │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[1]${WHITE} Install & Start Quick Tunnel       │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[2]${WHITE} Show Domain / NPV Config           │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[3]${WHITE} Restart (get new domain)           │${NC}"
+    echo -e "${WHITE}  │ ${RED}[4]${WHITE} Stop / Uninstall cloudflared      │${NC}"
+    echo -e "${WHITE}  ├──────────────────────────────────────────┤${NC}"
+    echo -e "${WHITE}  │ ${CYAN}── CDN Mode (own domain, port 80/443) ─${WHITE} │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[5]${WHITE} Setup Cloudflare CDN WS  (port 80) │${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[6]${WHITE} Setup Cloudflare CDN WSS (port 443)│${NC}"
+    echo -e "${WHITE}  │ ${GREEN}[7]${WHITE} Show CDN NPV Config                │${NC}"
+    echo -e "${WHITE}  ├──────────────────────────────────────────┤${NC}"
+    echo -e "${WHITE}  │ ${RED}[0]${WHITE} Back                               │${NC}"
+    echo -e "${WHITE}  └──────────────────────────────────────────┘${NC}"
     echo -ne "\n  ${YELLOW}Select: ${NC}"; read -r OPT
     case $OPT in
         1) install_cloudflare ;;
         2) show_cf_domain ;;
         3) restart_cf_tunnel ;;
-        4) systemctl stop cloudflared-tunnel; systemctl disable cloudflared-tunnel
-           echo -e "  ${YELLOW}Stopped.${NC}"; sleep 1; cloudflare_menu ;;
-        5) uninstall_cloudflare ;;
+        4) uninstall_cloudflare ;;
+        5) cf_cdn_ws_setup 80 ;;
+        6) cf_cdn_ws_setup 443 ;;
+        7) show_cf_cdn_config ;;
         0) main_menu ;;
         *) cloudflare_menu ;;
     esac
 }
+
 
 install_cloudflare() {
     banner
@@ -848,6 +857,93 @@ uninstall_cloudflare() {
     log "cloudflared uninstalled"
     read -rp "  Press Enter..."; cloudflare_menu
 }
+
+cf_cdn_ws_setup() {
+    local PORT="${1:-80}"
+    banner
+    echo -e "${CYAN}  [*] Cloudflare CDN WebSocket Setup (port ${PORT})${NC}\n"
+    echo -e "  ${WHITE}This uses YOUR OWN domain proxied through Cloudflare."
+    echo -e "  Your domain A-record must point to this server IP"
+    echo -e "  with the orange cloud (Proxied) ON in Cloudflare DNS.${NC}\n"
+    echo -e "  ${YELLOW}Cloudflare → Network → WebSocket must be ENABLED.${NC}\n"
+    echo -ne "  ${YELLOW}Enter your CF-proxied domain (e.g. vpn.example.com): ${NC}"
+    read -r CDN_DOM
+    CDN_DOM=$(echo "$CDN_DOM" | sed 's|https\?://||g' | tr -d '/')
+    [[ -z "$CDN_DOM" ]] && { echo -e "${RED}  Cancelled.${NC}"; read -rp "  Press Enter..."; cloudflare_menu; return; }
+
+    echo "${CDN_DOM}" > "$CONFIG_DIR/cf_cdn_domain.txt"
+    echo "${PORT}"    > "$CONFIG_DIR/cf_cdn_port.txt"
+    log "CF CDN domain saved: ${CDN_DOM} port ${PORT}"
+
+    show_cf_cdn_config
+}
+
+show_cf_cdn_config() {
+    banner
+    local CDN_DOM; CDN_DOM=$(cat "$CONFIG_DIR/cf_cdn_domain.txt" 2>/dev/null)
+    local CDN_PORT; CDN_PORT=$(cat "$CONFIG_DIR/cf_cdn_port.txt" 2>/dev/null || echo "80")
+    local IP; IP=$(get_public_ip)
+
+    if [[ -z "$CDN_DOM" ]]; then
+        echo -e "  ${RED}No CDN domain set. Use option [5] or [6] first.${NC}"
+        read -rp "  Press Enter..."; cloudflare_menu; return
+    fi
+
+    local SSL_LABEL WS_SCHEME
+    if [[ "$CDN_PORT" == "443" ]]; then
+        SSL_LABEL="ON  (Cloudflare handles TLS)"; WS_SCHEME="wss"
+    else
+        SSL_LABEL="OFF (plain WebSocket)";        WS_SCHEME="ws"
+    fi
+
+    echo -e "\n  ${WHITE}┌──────────────────────────────────────────────────────┐"
+    echo -e "  │  NPV Tunnel — Cloudflare CDN WebSocket Config        │"
+    echo -e "  ├──────────────────────────────────────────────────────┤"
+    echo -e "  │  SSH Host    : ${IP}"
+    echo -e "  │  SSH Port    : 22"
+    echo -e "  ├──────────────────────────────────────────────────────┤"
+    echo -e "  │  Network     : WebSocket"
+    echo -e "  │  WS Host     : ${CDN_DOM}"
+    echo -e "  │  WS Port     : ${CDN_PORT}"
+    echo -e "  │  SSL/TLS     : ${SSL_LABEL}"
+    echo -e "  ├──────────────────────────────────────────────────────┤"
+    echo -e "  │  Payload (NPV Tunnel CF mode — pick one):            │"
+    echo -e "  │                                                      │"
+    echo -e "  │  GET / HTTP/1.1[crlf]                                │"
+    echo -e "  │  Host: ${CDN_DOM}[crlf]                              │"
+    echo -e "  │  Upgrade: websocket[crlf][crlf]                      │"
+    echo -e "  │  ─── or use double-segment payload ────              │"
+    echo -e "  │  GET / HTTP/1.1[crlf]                                │"
+    echo -e "  │  Host: ${CDN_DOM}[crlf][crlf]                        │"
+    echo -e "  │  CF-RAY / HTTP/1.1[crlf]                             │"
+    echo -e "  │  Host: ${CDN_DOM}[crlf]                              │"
+    echo -e "  │  Upgrade: websocket[crlf]                            │"
+    echo -e "  │  Connection: Keep-Alive[crlf][crlf]                  │"
+    echo -e "  ├──────────────────────────────────────────────────────┤"
+    echo -e "  │  Cloudflare DNS checklist:                           │"
+    echo -e "  │  [✓] A record: ${CDN_DOM} → ${IP}                    │"
+    echo -e "  │  [✓] Proxy status: Orange cloud (Proxied) ON         │"
+    echo -e "  │  [✓] Network → WebSocket: ENABLED in CF dashboard    │"
+    if [[ "$CDN_PORT" == "80" ]]; then
+    echo -e "  │  [✓] Port 80 allowed by Cloudflare (default)         │"
+    else
+    echo -e "  │  [✓] SSL Mode: Full (required for port 443)          │"
+    fi
+    echo -e "  └──────────────────────────────────────────────────────┘${NC}"
+
+    local WS_RUNNING; WS_RUNNING=$(systemctl is-active ssh-ws 2>/dev/null)
+    local WS_PORT; WS_PORT=$(get_ws_port)
+    echo -e "\n  ${YELLOW}Server WS proxy port check:${NC}"
+    if [[ "$WS_RUNNING" == "active" && "$WS_PORT" == "$CDN_PORT" ]]; then
+        echo -e "  ${GREEN}[✓] WS proxy is running on port ${WS_PORT} — ready!${NC}"
+    else
+        echo -e "  ${RED}[!] WS proxy port is ${WS_PORT}, but CDN routes to ${CDN_PORT}.${NC}"
+        echo -e "  ${YELLOW}    SSH-WebSocket menu → Change WS Port → set to ${CDN_PORT}${NC}"
+    fi
+
+    read -rp "\n  Press Enter..."; cloudflare_menu
+}
+
 
 # ── [5] Payload Configurator ──────────────────────────────────────
 
